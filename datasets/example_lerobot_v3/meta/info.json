@@ -1,0 +1,193 @@
+{
+  "codebase_version": "v3.0",
+  "robot_type": "agibot_g2",
+  "total_episodes": 1,
+  "total_frames": 300,
+  "total_tasks": 1,
+  "chunks_size": 1000,
+  "data_files_size_in_mb": 0.0595,
+  "video_files_size_in_mb": 10.1553,
+  "fps": 30,
+  "splits": {
+    "train": "0:1"
+  },
+  "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+  "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+  "features": {
+    "observation.images.head_color": {
+      "dtype": "video",
+      "shape": [
+        400,
+        640,
+        3
+      ],
+      "names": [
+        "height",
+        "width",
+        "channel"
+      ],
+      "info": {
+        "video.height": 400,
+        "video.width": 640,
+        "video.codec": "hevc",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "video.fps": 30.0,
+        "video.channels": 3,
+        "has_audio": false
+      }
+    },
+    "observation.images.hand_left": {
+      "dtype": "video",
+      "shape": [
+        1056,
+        1280,
+        3
+      ],
+      "names": [
+        "height",
+        "width",
+        "channel"
+      ],
+      "info": {
+        "video.height": 1056,
+        "video.width": 1280,
+        "video.codec": "hevc",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "video.fps": 30.0,
+        "video.channels": 3,
+        "has_audio": false
+      }
+    },
+    "observation.images.hand_right": {
+      "dtype": "video",
+      "shape": [
+        1056,
+        1280,
+        3
+      ],
+      "names": [
+        "height",
+        "width",
+        "channel"
+      ],
+      "info": {
+        "video.height": 1056,
+        "video.width": 1280,
+        "video.codec": "hevc",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "video.fps": 30.0,
+        "video.channels": 3,
+        "has_audio": false
+      }
+    },
+    "observation.state": {
+      "dtype": "float64",
+      "shape": [
+        24
+      ],
+      "names": [
+        "left_joint_0",
+        "left_joint_1",
+        "left_joint_2",
+        "left_joint_3",
+        "left_joint_4",
+        "left_joint_5",
+        "left_joint_6",
+        "left_gripper",
+        "right_joint_0",
+        "right_joint_1",
+        "right_joint_2",
+        "right_joint_3",
+        "right_joint_4",
+        "right_joint_5",
+        "right_joint_6",
+        "right_gripper",
+        "head_joint_0",
+        "head_joint_1",
+        "head_joint_2",
+        "waist_joint_0",
+        "waist_joint_1",
+        "waist_joint_2",
+        "waist_joint_3",
+        "waist_joint_4"
+      ],
+      "fps": 30.0
+    },
+    "action": {
+      "dtype": "float64",
+      "shape": [
+        24
+      ],
+      "names": [
+        "left_joint_0",
+        "left_joint_1",
+        "left_joint_2",
+        "left_joint_3",
+        "left_joint_4",
+        "left_joint_5",
+        "left_joint_6",
+        "left_gripper",
+        "right_joint_0",
+        "right_joint_1",
+        "right_joint_2",
+        "right_joint_3",
+        "right_joint_4",
+        "right_joint_5",
+        "right_joint_6",
+        "right_gripper",
+        "head_joint_0",
+        "head_joint_1",
+        "head_joint_2",
+        "waist_joint_0",
+        "waist_joint_1",
+        "waist_joint_2",
+        "waist_joint_3",
+        "waist_joint_4"
+      ],
+      "fps": 30.0
+    },
+    "timestamp": {
+      "dtype": "float32",
+      "shape": [
+        1
+      ],
+      "names": null,
+      "fps": 30.0
+    },
+    "frame_index": {
+      "dtype": "int64",
+      "shape": [
+        1
+      ],
+      "names": null,
+      "fps": 30.0
+    },
+    "episode_index": {
+      "dtype": "int64",
+      "shape": [
+        1
+      ],
+      "names": null,
+      "fps": 30.0
+    },
+    "index": {
+      "dtype": "int64",
+      "shape": [
+        1
+      ],
+      "names": null,
+      "fps": 30.0
+    },
+    "task_index": {
+      "dtype": "int64",
+      "shape": [
+        1
+      ],
+      "names": null,
+      "fps": 30.0
+    }
+  }
+}

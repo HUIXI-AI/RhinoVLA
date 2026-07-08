@@ -1,0 +1,45 @@
+format: lerobot
+target_dim: 72
+fps: 30
+action_horizon: 30
+image_size: [256, 256]
+
+instruction:
+  source_key: subtask_prompt
+  fallback_keys: [task, prompt]
+
+datasets:
+  - dataset_id: example_lerobot_v3
+    root: datasets/example_lerobot_v3
+    repo_id: local/example_lerobot_v3
+    robot_instance_id: example_dual_arm_gripper_v0
+
+    views:
+      - {key: observation.images.head_color, role: top_head, modality: rgb, required: true}
+      - {key: observation.images.hand_left, role: hand_left, modality: rgb, required: true}
+      - {key: observation.images.hand_right, role: hand_right, modality: rgb, required: true}
+
+    state_source: observation.state
+    action_source: action
+    active_state_slots: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    active_action_slots: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+    sampling:
+      dataset_weight: 1.0
+      valid_chunk_filter: valid_intervals
+
+    native_joint_groups:
+      - slot_group: arm0_joint
+        state_source_indices: [0, 1, 2, 3, 4, 5, 6]
+        action_source_indices: [0, 1, 2, 3, 4, 5, 6]
+        target_slots: [0, 1, 2, 3, 4, 5, 6]
+
+      - slot_group: arm1_joint
+        state_source_indices: [8, 9, 10, 11, 12, 13, 14]
+        action_source_indices: [8, 9, 10, 11, 12, 13, 14]
+        target_slots: [7, 8, 9, 10, 11, 12, 13]
+
+      - slot_group: gripper
+        state_source_indices: [7, 15]
+        action_source_indices: [7, 15]
+        target_slots: [14, 15]

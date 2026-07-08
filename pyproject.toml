@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rhinovla"
+version = "0.1.0"
+description = "RhinoVLA: a cross-embodiment Qwen3-VL Vision-Language-Action training stack"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate==1.13.0",
+  "av==15.1.0",
+  "datasets==4.8.4",
+  "einops==0.8.2",
+  "huggingface-hub==1.9.0",
+  "lerobot==0.5.1",
+  "numpy==2.2.6",
+  "omegaconf==2.3.0",
+  "opencv-python==4.13.0.92",
+  "pandas==3.0.2",
+  "peft==0.18.1",
+  "Pillow==12.1.1",
+  "pyarrow==23.0.1",
+  "PyYAML==6.0.3",
+  "qwen-vl-utils==0.0.14",
+  "rich==13.9.4",
+  "safetensors==0.7.0",
+  "scipy==1.17.1",
+  "tokenizers==0.22.2",
+  "torch==2.10.0+cu128",
+  "torchvision==0.25.0+cu128",
+  "tqdm==4.67.3",
+  "transformers==5.3.0",
+]
+
+[project.optional-dependencies]
+# FlashAttention is optional: set framework.qwenvl.attn_implementation to "sdpa"
+# to train without it. The CUDA wheels are not always resolvable from PyPI;
+# install a build matching your torch/CUDA from the official source.
+flash = ["flash-attn>=2.6"]
+# SwanLab is an optional experiment tracker; training falls back to JSONL logging.
+# matplotlib is only used by the SwanLab teacher-forcing curve/visualization path.
+logging = ["swanlab==0.7.15", "matplotlib==3.10.8"]
+[tool.setuptools.packages.find]
+include = ["rhinovla*"]
+
+[tool.setuptools.package-data]
+rhinovla = ["assets/qwen3_vl_processor/*"]

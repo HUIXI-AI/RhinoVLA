@@ -1,0 +1,55 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+.env.local
+
+# Models, datasets, checkpoints and large artifacts
+models/
+checkpoints/
+
+/datasets/*
+!/datasets/compute_norm_json.py
+!/datasets/example_lerobot_v3/
+!/datasets/example_lerobot_v3/**
+/datasets/example_lerobot_v3/meta/*.json
+!/datasets/example_lerobot_v3/meta/episode_segments_summary.json
+!/datasets/example_lerobot_v3/meta/info.json
+!/datasets/example_lerobot_v3/meta/norm.json
+!/datasets/example_lerobot_v3/meta/stats.json
+experiments/
+outputs/
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.ckpt
+*.pkl
+*.npy
+*.npz
+*.h5
+
+# Logs and tracker caches
+logs/
+*.log
+swanlog/
+wandb/
+metrics_analysis/
+
+# Editors / OS
+.idea/
+.vscode/
+*.sw?
+.DS_Store

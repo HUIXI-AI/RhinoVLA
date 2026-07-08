@@ -1,0 +1,52 @@
+RhinoVLA Example LeRobot v3 Dataset License
+
+Copyright (c) 2026 HuixiAI
+
+This license applies only to the example dataset files under:
+
+  datasets/example_lerobot_v3/
+
+The RhinoVLA source code is licensed separately under the repository root
+LICENSE file. This dataset license covers the bundled LeRobot v3 example data,
+including parquet metadata, parquet episode data, norm/statistics files, and
+video files in this directory.
+
+License
+-------
+
+The example dataset is made available under the Creative Commons
+Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
+
+You may copy, share, and adapt the dataset for non-commercial research,
+education, benchmarking, documentation, and RhinoVLA integration testing,
+provided that you give appropriate credit to HuixiAI and indicate whether
+changes were made.
+
+You may not use this dataset for commercial purposes without prior written
+permission from HuixiAI.
+
+Privacy Notice
+--------------
+
+The videos in this example dataset are provided only to demonstrate the
+RhinoVLA data format and training pipeline. Where people appear in video, faces
+have been anonymized before release.
+
+You may not use this dataset, alone or combined with other data, to identify,
+re-identify, profile, track, or otherwise infer the identity of any person
+appearing in the videos.
+
+No Warranty
+-----------
+
+The dataset is provided "AS IS", without warranties or conditions of any kind,
+including but not limited to warranties of merchantability, fitness for a
+particular purpose, non-infringement, data completeness, or annotation
+correctness.
+
+License Text
+------------
+
+The full CC BY-NC 4.0 license text is available at:
+
+  https://creativecommons.org/licenses/by-nc/4.0/legalcode
