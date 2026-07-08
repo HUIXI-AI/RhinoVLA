@@ -23,19 +23,23 @@
 如果要上报 SwanLab：
 
 ```bash
-SWANLAB_API_KEY=... TRACKERS='[jsonl,swanlab]' ./scripts/train/demo_train.sh
+SWANLAB_API_KEY=... \
+SWANLAB_PROJECT=rhinovla-finetune \
+TRACKERS='[jsonl,swanlab]' \
+./scripts/train/demo_train.sh
 ```
 
 本地部署 SwanLab 需要额外指定地址：
 
 ```bash
 SWANLAB_API_KEY=... \
+SWANLAB_PROJECT=rhinovla-finetune \
 SWANLAB_WEB_HOST=http://your-swanlab-host:8000 \
 TRACKERS='[jsonl,swanlab]' \
 ./scripts/train/demo_train.sh
 ```
 
-`SWANLAB_API_HOST` 也可替代 `SWANLAB_WEB_HOST`。其他训练参数可以用命令行覆盖，例如：
+`SWANLAB_PROJECT` 未设置时默认使用 `rhinovla-finetune`。`SWANLAB_API_HOST` 也可替代 `SWANLAB_WEB_HOST`。其他训练参数可以用命令行覆盖，例如：
 
 ```bash
 ./scripts/train/demo_train.sh trainer.max_train_steps=10 run_id=debug_10steps

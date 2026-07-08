@@ -56,6 +56,18 @@ def _swanlab_login_hosts() -> tuple[str | None, str | None]:
     return login_host, web_host
 
 
+def _swanlab_project_name(config) -> str:
+    env_project = os.environ.get("SWANLAB_PROJECT")
+    if env_project and env_project.strip():
+        return env_project.strip()
+
+    config_project = getattr(config, "swanlab_project", None)
+    if config_project:
+        return str(config_project)
+
+    return "rhinovla-finetune"
+
+
 class _MetricsMixin:
     """Metrics, logging, profiling and hardware-efficiency methods for VLATrainer."""
 
@@ -134,10 +146,7 @@ class _MetricsMixin:
                     )
                     swanlab_run_id = None
 
-                swanlab_project = (
-                    getattr(self.config, "swanlab_project", None)
-                    or "rhinovla-release"
-                )
+                swanlab_project = _swanlab_project_name(self.config)
                 swanlab_init_kwargs = {
                     "project": str(swanlab_project),
                     "experiment_name": self.config.run_id,

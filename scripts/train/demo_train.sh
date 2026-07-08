@@ -7,8 +7,8 @@ CONFIG=${CONFIG:-configs/training/demo_ae_finetune.yaml}
 CHECKPOINT=${CHECKPOINT:-checkpoints/rhinovla_pretrain.ckpt}
 
 # Optional SwanLab reporting:
-#   SWANLAB_API_KEY=... SWANLAB_WEB_HOST=http://your-swanlab-host:8000 TRACKERS='[jsonl,swanlab]' ./scripts/train/demo_train.sh
-#   SWANLAB_API_KEY=... TRACKERS='[jsonl,swanlab]' ./scripts/train/demo_train.sh   # SwanLab online
+#   SWANLAB_API_KEY=... SWANLAB_PROJECT=rhinovla-finetune SWANLAB_WEB_HOST=http://your-swanlab-host:8000 TRACKERS='[jsonl,swanlab]' ./scripts/train/demo_train.sh
+#   SWANLAB_API_KEY=... SWANLAB_PROJECT=rhinovla-finetune TRACKERS='[jsonl,swanlab]' ./scripts/train/demo_train.sh   # SwanLab online
 
 if [[ ! -f "${CHECKPOINT}" ]]; then
   echo "missing ${CHECKPOINT}" >&2
