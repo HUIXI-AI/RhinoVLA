@@ -423,7 +423,7 @@ class RhinoVLA(nn.Module):
             torch.tensor(self.beta_alpha, dtype=torch.float32, device=device),
             torch.tensor(self.beta_beta, dtype=torch.float32, device=device),
         )
-        return (dist.sample((batch_size,)) * 0.999 + 0.001).to(torch.float32)
+        return (dist.sample((batch_size,)) * 0.999).to(torch.float32)
 
     def _prepare_masked_actions(self, examples: List[dict], device: torch.device) -> tuple[Tensor, Tensor]:
         actions = torch.as_tensor(np.asarray([ex["action"] for ex in examples]), dtype=torch.float32).to(
