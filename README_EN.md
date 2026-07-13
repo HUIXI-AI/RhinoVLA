@@ -49,6 +49,8 @@ For dataset preparation, see [Data Preparation](docs/DATA_PREPARATION.md).
 Download pretrained weights from Hugging Face:
 [HuixiAI/RhinoVLA](https://huggingface.co/HuixiAI/RhinoVLA). The Hugging Face repo provides
 `rhinovla_pretrain.ckpt`, which is used by the default training configs.
+The weights are also available on ModelScope:
+[huixiAI/RhinoVLA](https://www.modelscope.cn/models/huixiAI/RhinoVLA).
 
 Download the file into this repository's `checkpoints/`. The default configs load
 `trainer.pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt`.

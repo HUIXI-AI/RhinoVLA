@@ -45,6 +45,7 @@ RhinoVLA 在辉羲 R1 芯片上实现了 **11.69Hz** 端到端推理频率，跨
 
 预训练参数统一从 Hugging Face 下载: [HuixiAI/RhinoVLA](https://huggingface.co/HuixiAI/RhinoVLA)。
 Hugging Face 仓库提供默认训练配置使用的 `rhinovla_pretrain.ckpt`。
+也可从 ModelScope 下载: [huixiAI/RhinoVLA](https://www.modelscope.cn/models/huixiAI/RhinoVLA)。
 
 下载到本仓库的 `checkpoints/` 后即可微调。默认配置加载
 `trainer.pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt`。
