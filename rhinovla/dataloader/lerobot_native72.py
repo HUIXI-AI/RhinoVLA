@@ -28,10 +28,17 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 from PIL import Image
+from qwen_vl_utils.vision_process import smart_resize as qwen_smart_resize
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 
 RHINO72_DIM = 72
+ACTION_TYPE_ABSOLUTE = "absolute_joint_position"
+ACTION_TYPE_DELTA = "delta_from_current_state"
+ACTION_TYPES = (ACTION_TYPE_ABSOLUTE, ACTION_TYPE_DELTA)
+_IMAGE_SHORT_SIDE = 256
+_IMAGE_RESIZE_FACTOR = 32
+_IMAGE_MAX_LONG_SIDE = 512
 
 
 @dataclass(frozen=True)
@@ -126,6 +133,128 @@ def _normalize_valid_chunk_filter(value: Any) -> str:
         allowed = ", ".join(VALID_CHUNK_FILTER_MODES)
         raise ValueError(f"sampling.valid_chunk_filter must be one of: {allowed}; got {value!r}")
     return raw
+
+
+def _normalize_action_type(value: Any) -> str:
+    raw = str(value or ACTION_TYPE_ABSOLUTE).strip().lower()
+    if raw not in ACTION_TYPES:
+        raise ValueError(f"action_type must be one of {ACTION_TYPES}, got {value!r}")
+    return raw
+
+
+def _resolve_action_delta_slots(
+    *,
+    action_type: str,
+    active_state_slots: Sequence[int],
+    active_action_slots: Sequence[int],
+    absolute_action_slots: Sequence[int],
+) -> list[int]:
+    """Resolve the generic action representation in Rhino72 target slots.
+
+    In delta mode every active action slot with a same-slot state becomes a
+    delta except explicitly absolute gripper opening slots. Action-only command
+    slots (for example a velocity command) keep their native command semantics.
+    """
+    mode = _normalize_action_type(action_type)
+    action_slots = sorted({int(slot) for slot in active_action_slots})
+    if mode == ACTION_TYPE_ABSOLUTE:
+        return []
+
+    state_slots = {int(slot) for slot in active_state_slots}
+    absolute_slots = {int(slot) for slot in absolute_action_slots}
+    bad_absolute = sorted(slot for slot in absolute_slots if slot < 0 or slot >= RHINO72_DIM)
+    if bad_absolute:
+        raise ValueError(f"absolute_action_slots out of Rhino72 range: {bad_absolute}")
+    return [
+        slot
+        for slot in action_slots
+        if slot not in absolute_slots and slot in state_slots
+    ]
+
+
+def _action_to_model_space(
+    action_abs: Any,
+    current_state: Any,
+    *,
+    delta_slots: Sequence[int],
+) -> np.ndarray:
+    """Return absolute actions or `action - chunk_start_state` on selected slots."""
+    action_model = np.asarray(action_abs, dtype=np.float32).copy()
+    state = np.asarray(current_state, dtype=np.float32).reshape(-1)
+    slots = np.asarray([int(slot) for slot in delta_slots], dtype=np.int64)
+    if slots.size == 0:
+        return action_model
+    if action_model.ndim not in (1, 2):
+        raise ValueError(f"action must be 1D or 2D, got shape {action_model.shape}")
+    max_slot = int(slots.max())
+    if action_model.shape[-1] <= max_slot or state.shape[0] <= max_slot:
+        raise ValueError(
+            f"delta slot {max_slot} is outside action/state shapes "
+            f"{action_model.shape}/{state.shape}"
+        )
+    if action_model.ndim == 1:
+        action_model[slots] -= state[slots]
+    else:
+        action_model[:, slots] -= state[None, slots]
+    return action_model
+
+
+def _select_action_norm_stats(
+    norm: dict[str, Any],
+    *,
+    action_type: str,
+    delta_slots: Sequence[int],
+    absolute_action_slots: Sequence[int],
+) -> dict[str, Any]:
+    """Select one action space from a combined norm file.
+
+    Legacy files containing only `action_mean/std` remain valid for absolute
+    training. Delta training requires explicit delta fields and matching
+    metadata so an absolute norm can never be used accidentally.
+    """
+    mode = _normalize_action_type(action_type)
+    if mode == ACTION_TYPE_ABSOLUTE:
+        has_abs_mean = "action_abs_mean" in norm
+        has_abs_std = "action_abs_std" in norm
+        if has_abs_mean != has_abs_std:
+            raise ValueError(
+                "combined norm must contain both action_abs_mean and action_abs_std"
+            )
+        mean_key = "action_abs_mean" if has_abs_mean else "action_mean"
+        std_key = "action_abs_std" if has_abs_std else "action_std"
+    else:
+        mean_key = "action_delta_mean"
+        std_key = "action_delta_std"
+        missing = [key for key in (mean_key, std_key) if key not in norm]
+        if missing:
+            raise ValueError(
+                f"delta_from_current_state requires combined norm fields {missing}; "
+                "regenerate norm.json with datasets/compute_norm_json.py"
+            )
+        meta = norm.get("_meta", {}) or {}
+        expected_delta = sorted(int(slot) for slot in delta_slots)
+        actual_delta = sorted(int(slot) for slot in meta.get("delta_from_state_slots", []))
+        if actual_delta != expected_delta:
+            raise ValueError(
+                "norm delta_from_state_slots do not match loader mapping: "
+                f"norm={actual_delta}, loader={expected_delta}"
+            )
+        expected_absolute = sorted(int(slot) for slot in absolute_action_slots)
+        actual_absolute = sorted(int(slot) for slot in meta.get("absolute_action_slots", []))
+        if actual_absolute != expected_absolute:
+            raise ValueError(
+                "norm absolute_action_slots do not match loader mapping: "
+                f"norm={actual_absolute}, loader={expected_absolute}"
+            )
+    for key in ("state_mean", "state_std", mean_key, std_key):
+        if key not in norm:
+            raise ValueError(f"norm file missing required field {key!r}")
+    return {
+        "state_mean": norm["state_mean"],
+        "state_std": norm["state_std"],
+        "action_mean": norm[mean_key],
+        "action_std": norm[std_key],
+    }
 
 
 def _flatten_dim_list(spec: Any) -> List[int]:
@@ -447,8 +576,6 @@ class LeRobotNative72Dataset(Dataset):
         self,
         mapping_path: str | Path,
         action_horizon: int = 30,
-        image_size: Sequence[int] = (256, 256),
-        image_size_by_camera: Optional[Dict[str, Sequence[int]]] = None,
         stats_override: Optional[Dict[str, np.ndarray]] = None,
         episodes: Optional[Sequence[int]] = None,
         image_aug_profile: str = "none",
@@ -461,6 +588,7 @@ class LeRobotNative72Dataset(Dataset):
         sample_weight_override_mode: str = "replace",
         camera_dropout: Optional[Dict[str, Any]] = None,
         mapping_dataset_id: Optional[str] = None,
+        action_type: str = ACTION_TYPE_ABSOLUTE,
     ) -> None:
         self.native_mapping = load_lerobot_mapping(mapping_path, dataset_id=mapping_dataset_id)
         self.mapping = self.native_mapping.raw
@@ -470,8 +598,6 @@ class LeRobotNative72Dataset(Dataset):
             raise ValueError(f"mapping {mapping_path} does not define a LeRobot root")
 
         self.action_horizon = int(action_horizon)
-        self.image_size = tuple(image_size) if image_size else None
-
         # Camera order is fixed by mapping. Keep insertion order. New mappings
         # may declare arbitrary views; legacy mappings can still use
         # camera_mapping aliases.
@@ -483,13 +609,6 @@ class LeRobotNative72Dataset(Dataset):
             self.camera_order = [view.role for view in self.native_mapping.views]
             self.camera_source_keys = [view.key for view in self.native_mapping.views]
         self._camera_alias_by_source = dict(zip(self.camera_source_keys, self.camera_order))
-        self.image_size_by_source: Dict[str, tuple[int, int]] = {}
-        if image_size_by_camera:
-            for alias, source_key in zip(self.camera_order, self.camera_source_keys):
-                size = image_size_by_camera.get(alias, image_size_by_camera.get(source_key))
-                if size:
-                    self.image_size_by_source[source_key] = (int(size[0]), int(size[1]))
-
         cd_cfg = camera_dropout or {}
         self.camera_dropout_enabled = bool(cd_cfg.get("enabled", False))
         self.camera_dropout_p = float(cd_cfg.get("p", 0.0))
@@ -524,6 +643,27 @@ class LeRobotNative72Dataset(Dataset):
         self.action_source_key = self.action_spec.source_key
         self.state_active_dims = list(self.state_spec.source_indices)
         self.action_active_dims = list(self.action_spec.source_indices)
+        self.action_type = _normalize_action_type(action_type)
+        active_action_slot_set = {int(slot) for slot in self.action_spec.active_slots}
+        self.absolute_action_slots = sorted(
+            {
+                int(slot)
+                for slot in self.mapping.get("absolute_action_slots", [])
+                if int(slot) in active_action_slot_set
+            }
+        )
+        self.delta_action_slots = _resolve_action_delta_slots(
+            action_type=self.action_type,
+            active_state_slots=self.state_spec.active_slots,
+            active_action_slots=self.action_spec.active_slots,
+            absolute_action_slots=self.absolute_action_slots,
+        )
+        print(
+            f"[LeRobotAdapter] action_type={self.action_type} "
+            f"delta_from_state_slots={self.delta_action_slots} "
+            f"absolute_action_slots={self.absolute_action_slots}",
+            flush=True,
+        )
 
         # Sample weight + valid chunk start columns (converter populates them).
         sampling_cfg = self.mapping.get("sampling", {})
@@ -963,21 +1103,33 @@ class LeRobotNative72Dataset(Dataset):
         self, stats_override: Optional[Dict[str, np.ndarray]]
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if stats_override:
+            selected_stats = _select_action_norm_stats(
+                stats_override,
+                action_type=self.action_type,
+                delta_slots=self.delta_action_slots,
+                absolute_action_slots=self.absolute_action_slots,
+            )
             return (
-                expand_stats_to_rhino72(stats_override["action_mean"], spec=self.action_spec, fill_value=0.0),
+                expand_stats_to_rhino72(selected_stats["action_mean"], spec=self.action_spec, fill_value=0.0),
                 expand_stats_to_rhino72(
-                    stats_override["action_std"],
+                    selected_stats["action_std"],
                     spec=self.action_spec,
                     fill_value=1.0,
                     transform_values=False,
                 ),
-                expand_stats_to_rhino72(stats_override["state_mean"], spec=self.state_spec, fill_value=0.0),
+                expand_stats_to_rhino72(selected_stats["state_mean"], spec=self.state_spec, fill_value=0.0),
                 expand_stats_to_rhino72(
-                    stats_override["state_std"],
+                    selected_stats["state_std"],
                     spec=self.state_spec,
                     fill_value=1.0,
                     transform_values=False,
                 ),
+            )
+
+        if self.action_type == ACTION_TYPE_DELTA:
+            raise ValueError(
+                "delta_from_current_state requires a combined norm_stats_path; "
+                "relative action stats cannot fall back to raw absolute-action statistics"
             )
 
         # Otherwise compute over the full dataset's native source columns and
@@ -1077,12 +1229,17 @@ class LeRobotNative72Dataset(Dataset):
             fill_value=0.0,
             value_transforms=self.state_spec.value_transforms,
         )
-        action_raw = pack_source_to_rhino72(
+        action_abs_raw = pack_source_to_rhino72(
             action_src,
             source_indices=self.action_spec.source_indices,
             target_slots=self.action_spec.target_slots,
             fill_value=0.0,
             value_transforms=self.action_spec.value_transforms,
+        )
+        action_raw = _action_to_model_space(
+            action_abs_raw,
+            state_raw,
+            delta_slots=self.delta_action_slots,
         )
         ep_idx = int(_scalar_py(row["episode_index"]))
         original_episode_id = str(_scalar_py(row.get("original_episode_id", "")))
@@ -1205,34 +1362,25 @@ class LeRobotNative72Dataset(Dataset):
             f"no usable instruction in sample: tried {[self.instruction_source, *self.instruction_fallbacks]}"
         )
 
-    def _select_image(self, tensor_or_pil: Any, camera_key: Optional[str] = None) -> Image.Image:
+    def _select_image(self, tensor_or_pil: Any) -> Image.Image:
         if isinstance(tensor_or_pil, torch.Tensor):
             img = _tensor_to_pil(tensor_or_pil)
         elif isinstance(tensor_or_pil, Image.Image):
             img = tensor_or_pil
         else:
             raise TypeError(f"unexpected image type from LeRobot: {type(tensor_or_pil)}")
-        target_size = self.image_size_by_source.get(camera_key) if camera_key else None
-        if target_size is None:
-            target_size = self.image_size
-        if target_size:
-            mode = getattr(self, "image_resize_mode", "squash")
-            if mode == "letterbox":
-                # Aspect-ratio-preserving: longest side = target, shorter side symmetric
-                # zero-pad onto a black canvas (== RhinoVLA's _resize_longest_side_pad).
-                tw, th = int(target_size[0]), int(target_size[1])
-                sw, sh = img.size
-                if tw > 0 and th > 0 and sw > 0 and sh > 0:
-                    scale = min(tw / sw, th / sh)
-                    nw, nh = max(1, int(round(sw * scale))), max(1, int(round(sh * scale)))
-                    resized = img.resize((nw, nh), Image.BICUBIC)
-                    canvas = Image.new("RGB", (tw, th), (0, 0, 0))
-                    canvas.paste(resized, ((tw - nw) // 2, (th - nh) // 2))
-                    img = canvas
-            else:
-                # Legacy AR-distorting square resize kept for back-compat.
-                img = img.resize(tuple(target_size), resample=Image.BICUBIC)
-        return img
+        sw, sh = img.size
+        if sw <= 0 or sh <= 0:
+            raise ValueError(f"image dimensions must be positive, got {(sw, sh)}")
+        scale = float(_IMAGE_SHORT_SIDE) / float(min(sw, sh))
+        target_h, target_w = qwen_smart_resize(
+            float(sh) * scale,
+            float(sw) * scale,
+            factor=_IMAGE_RESIZE_FACTOR,
+            min_pixels=_IMAGE_SHORT_SIDE * _IMAGE_SHORT_SIDE,
+            max_pixels=_IMAGE_SHORT_SIDE * _IMAGE_MAX_LONG_SIDE,
+        )
+        return img.convert("RGB").resize((int(target_w), int(target_h)), Image.BICUBIC)
 
     def _apply_role_image_aug(self, image: Image.Image, role: Optional[str]) -> Image.Image:
         if self._role_aug_target_role is None or str(role or "") != self._role_aug_target_role:
@@ -1309,19 +1457,24 @@ class LeRobotNative72Dataset(Dataset):
             fill_value=0.0,
             value_transforms=self.state_spec.value_transforms,
         )
-        action_raw = pack_source_to_rhino72(
+        action_abs_raw = pack_source_to_rhino72(
             action_raw_source,
             source_indices=self.action_spec.source_indices,
             target_slots=self.action_spec.target_slots,
             fill_value=0.0,
             value_transforms=self.action_spec.value_transforms,
         )
+        action_raw = _action_to_model_space(
+            action_abs_raw,
+            state_raw,
+            delta_slots=self.delta_action_slots,
+        )
         normalized_state = (state_raw - self.state_mean) / self.state_std
         normalized_action = (action_raw - self.action_mean[None, :]) / self.action_std[None, :]
         action_mask = np.broadcast_to(mask_from_spec(self.action_spec), normalized_action.shape).copy()
         state_mask = np.broadcast_to(mask_from_spec(self.state_spec), normalized_state[None, :].shape).copy()
 
-        pil_images = [self._select_image(sample[k], camera_key=k) for k in self.camera_source_keys]
+        pil_images = [self._select_image(sample[k]) for k in self.camera_source_keys]
         if self._image_aug is not None:
             pil_images = [self._image_aug(img) for img in pil_images]
         if self._role_aug_target_role is not None:
@@ -1384,7 +1537,13 @@ class LeRobotNative72Dataset(Dataset):
 # ---------------------------------------------------------------------------
 # `build_dataloader` entry point.
 # ---------------------------------------------------------------------------
-def _resolve_lerobot_stats(vla_cfg, split: str) -> Optional[Dict[str, list]]:
+def _norm_payload_to_dict(value: Any) -> dict[str, Any]:
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)  # type: ignore[return-value]
+    return dict(value)
+
+
+def _resolve_lerobot_stats(vla_cfg, split: str) -> Optional[Dict[str, Any]]:
     """Return configured normalization stats, or None when fallback is allowed.
 
     Raises a fatal error if `norm_stats_path` is configured but the file is
@@ -1396,13 +1555,7 @@ def _resolve_lerobot_stats(vla_cfg, split: str) -> Optional[Dict[str, list]]:
         path = Path(norm_stats_path)
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
-                ns = json.load(f)
-            return {
-                "action_mean": ns["action_mean"],
-                "action_std": ns["action_std"],
-                "state_mean": ns["state_mean"],
-                "state_std": ns["state_std"],
-            }
+                return json.load(f)
         if not bool(vla_cfg.get("allow_norm_stats_fallback", False)):
             raise FileNotFoundError(
                 f"norm_stats_path {path} not found and allow_norm_stats_fallback "
@@ -1415,13 +1568,7 @@ def _resolve_lerobot_stats(vla_cfg, split: str) -> Optional[Dict[str, list]]:
         # train loader's already-resolved stats), prefer it over a per-dataset
         # recompute — that keeps train/val on the same canonical space.
         if vla_cfg.get("norm_stats", None):
-            ns = vla_cfg.norm_stats
-            return {
-                "action_mean": list(ns.action_mean) if hasattr(ns, "action_mean") else list(ns["action_mean"]),
-                "action_std": list(ns.action_std) if hasattr(ns, "action_std") else list(ns["action_std"]),
-                "state_mean": list(ns.state_mean) if hasattr(ns, "state_mean") else list(ns["state_mean"]),
-                "state_std": list(ns.state_std) if hasattr(ns, "state_std") else list(ns["state_std"]),
-            }
+            return _norm_payload_to_dict(vla_cfg.norm_stats)
         print(
             f"[WARN] norm_stats_path {path} missing but "
             f"allow_norm_stats_fallback=true — computing per-dataset stats.",
@@ -1429,13 +1576,7 @@ def _resolve_lerobot_stats(vla_cfg, split: str) -> Optional[Dict[str, list]]:
         )
         return None
     if vla_cfg.get("norm_stats", None):
-        ns = vla_cfg.norm_stats
-        return {
-            "action_mean": list(ns.action_mean),
-            "action_std": list(ns.action_std),
-            "state_mean": list(ns.state_mean),
-            "state_std": list(ns.state_std),
-        }
+        return _norm_payload_to_dict(vla_cfg.norm_stats)
     return None
 
 
@@ -1503,8 +1644,6 @@ def build_dataloader(cfg, dataset_py: str = "lerobot_native72", split: str = "tr
     dataset = LeRobotNative72Dataset(
         mapping_path=mapping_path,
         action_horizon=int(vla_cfg.get("action_horizon", 30)),
-        image_size=image_size,
-        image_size_by_camera=vla_cfg.get("image_size_by_camera", None),
         stats_override=stats_override,
         episodes=episodes_filter,
         image_aug_profile=aug_profile,
@@ -1517,16 +1656,11 @@ def build_dataloader(cfg, dataset_py: str = "lerobot_native72", split: str = "tr
         camera_dropout=vla_cfg.get("camera_dropout", None) if split == "train" else None,
         sample_weight_override_mode=str(vla_cfg.get("sample_weight_override_mode", "replace")),
         mapping_dataset_id=vla_cfg.get("mapping_dataset_id", None),
+        action_type=str(vla_cfg.get("action_type", ACTION_TYPE_ABSOLUTE)),
     )
 
-    # Image-input + view-prompt unification knobs (run-config, NOT mapping):
-    #   image_resize_mode: "letterbox" (aspect-preserving long-side + symmetric 0-pad ==
-    #     RhinoVLA) or "squash" (legacy square resize). Default "squash" keeps
-    #     legacy behavior for older configs.
-    #   view_roles / view_modalities: per-camera labels (ordered like camera_mapping/obs)
-    #     attached to every example so use_view_registry_prompt builds the RhinoVLA
-    #     "[role | modality]" prompt. Unset -> bare-instruction prompt.
-    dataset.image_resize_mode = str(vla_cfg.get("image_resize_mode", "squash")).lower()
+    # Per-camera labels are attached to every example so the compact view prompt
+    # can preserve the relationship between image order and camera role.
     _vr = vla_cfg.get("view_roles", None)
     _vm = vla_cfg.get("view_modalities", None)
     dataset.view_roles = [str(x) for x in _vr] if _vr else None
@@ -1539,6 +1673,9 @@ def build_dataloader(cfg, dataset_py: str = "lerobot_native72", split: str = "tr
         vla_cfg.state_std = dataset.state_std.tolist()
         vla_cfg.action_mean = dataset.action_mean.tolist()
         vla_cfg.action_std = dataset.action_std.tolist()
+        vla_cfg.action_type = dataset.action_type
+        vla_cfg.action_delta_from_state_dims = list(dataset.delta_action_slots)
+        vla_cfg.absolute_action_slots = list(dataset.absolute_action_slots)
 
     sampler = None
     shuffle = True

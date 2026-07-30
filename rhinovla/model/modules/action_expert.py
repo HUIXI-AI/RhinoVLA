@@ -362,6 +362,35 @@ class RhinoActionIO(nn.Module):
         return self.action_out_proj(action_hidden.to(torch.float32))
 
 
+def build_suffix_position_ids(
+    prefix_mask: Tensor,
+    suffix_mask: Tensor,
+    prefix_rope_deltas: Tensor,
+) -> Tensor:
+    """Build AE suffix mRoPE ids from Qwen3-VL's continuation delta."""
+    if prefix_mask.ndim != 2 or suffix_mask.ndim != 2:
+        raise ValueError("prefix_mask and suffix_mask must be rank-2 tensors")
+    if prefix_mask.shape[0] != suffix_mask.shape[0]:
+        raise ValueError("prefix_mask and suffix_mask batch sizes differ")
+
+    if prefix_rope_deltas.dtype != torch.long:
+        raise TypeError(
+            f"prefix_rope_deltas must have dtype torch.long, got {prefix_rope_deltas.dtype}"
+        )
+    if prefix_rope_deltas.ndim == 1:
+        prefix_rope_deltas = prefix_rope_deltas[:, None]
+    if tuple(prefix_rope_deltas.shape) != (prefix_mask.shape[0], 1):
+        raise ValueError(
+            "prefix_rope_deltas must have shape [batch, 1], got "
+            f"{tuple(prefix_rope_deltas.shape)}"
+        )
+    prefix_offsets = prefix_mask.long().sum(dim=-1, keepdim=True)
+    prefix_offsets = prefix_offsets + prefix_rope_deltas.to(prefix_offsets.device)
+
+    suffix_pos = prefix_offsets + torch.cumsum(suffix_mask.long(), dim=1) - 1
+    return suffix_pos[None, ...].expand(3, -1, -1)
+
+
 class RhinoActionExpert(nn.Module):
     """Complete Rhino action expert: IO, mask conditioning, transformer, and head."""
 
@@ -436,22 +465,17 @@ class RhinoActionExpert(nn.Module):
         x_t: Tensor,
         action_mask: Tensor | None,
         time: Tensor,
+        prefix_rope_deltas: Tensor,
         prefix_layer_offset: int = 0,
     ) -> Tensor:
         suffix_embeds, suffix_mask, adarms_cond = self.io.embed_suffix(state, x_t, time)
         suffix_embeds = self._apply_mask_condition(suffix_embeds, state_mask, action_mask)
         suffix_embeds = suffix_embeds.to(dtype=next(self.transformer.parameters()).dtype)
-        # Known issue: for Qwen3-VL image prefixes, the official continuation
-        # position is raw_prefix_token_count + outputs.rope_deltas, because
-        # multimodal mRoPE compacts image tokens into a different positional
-        # range. This legacy path uses only the raw valid-token count, so suffix
-        # action RoPE positions can be offset when images are present. Current
-        # runs do not treat this as an immediate quality blocker; the next fix
-        # should pass Qwen3-VL rope_deltas from the prefix forward path and use
-        # that continuation offset here.
-        prefix_offsets = prefix_mask.long().sum(dim=-1)[:, None]
-        suffix_pos = prefix_offsets + torch.cumsum(suffix_mask.long(), dim=1) - 1
-        position_ids = suffix_pos[None, ...].expand(3, -1, -1)
+        position_ids = build_suffix_position_ids(
+            prefix_mask,
+            suffix_mask,
+            prefix_rope_deltas,
+        )
         suffix_hidden = self.transformer(
             suffix_embeds,
             prefix_key_values=prefix_key_values,

@@ -47,12 +47,12 @@ For dataset preparation, see [Data Preparation](docs/DATA_PREPARATION.md).
 ### Pretrained weights
 
 Download pretrained weights from Hugging Face:
-[HuixiAI/RhinoVLA](https://huggingface.co/HuixiAI/RhinoVLA). The Hugging Face repo provides
-`rhinovla_pretrain.ckpt`, which is used by the default training configs.
+[HuixiAI/RhinoVLA](https://huggingface.co/HuixiAI/RhinoVLA).
 The weights are also available on ModelScope:
 [huixiAI/RhinoVLA](https://www.modelscope.cn/models/huixiAI/RhinoVLA).
 
-Download the file into this repository's `checkpoints/`. The default configs load
+Put a pretrained checkpoint compatible with the current model structure in this
+repository's `checkpoints/`. The default configs load
 `trainer.pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt`.
 The weight model card, license, and usage notes are maintained on the Hugging
 Face repository page.
@@ -61,9 +61,9 @@ Face repository page.
 
 - `rhinovla/`: core Python package with model framework, Qwen3-VL wrapper, Action Expert, LeRobot dataloading, and training logic.
 - `rhinovla/assets/qwen3_vl_processor/`: local Qwen3-VL processor / tokenizer configuration.
-- `configs/training/`: training configs, including Action Expert finetuning and full-parameter finetuning.
+- `configs/training/`: full-parameter finetuning config with the vision encoder frozen.
 - `configs/data_mappings/`: mappings from raw LeRobot v3 state/action fields to RhinoVLA 72D slots.
-- `datasets/example_lerobot_v3/`: minimal LeRobot v3 demo dataset for `demo_ae_finetune.yaml`.
+- `datasets/example_lerobot_v3/`: minimal LeRobot v3 demo dataset for `demo_full_finetune.yaml`.
 - `checkpoints/`: pretrained weights.
 - `scripts/train/`: training launch scripts.
 - `docs/`: finetuning documentation.

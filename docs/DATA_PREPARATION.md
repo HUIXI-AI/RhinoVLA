@@ -19,7 +19,6 @@ native72 mapping,把数据集原生 `observation.state` 和 `action` 显式映�
 
 ```text
 configs/data_mappings/demo_lerobot_native72.yaml
-configs/training/demo_ae_finetune.yaml
 configs/training/demo_full_finetune.yaml
 ```
 
@@ -159,6 +158,19 @@ std  = (p99 - p01) / 2
 std < 0.01 的维度使用 1.0
 ```
 
+对 native72 mapping，脚本默认每次都生成两套 72D action 统计：
+
+- `action_abs_mean/std`：原始绝对动作空间。
+- `action_delta_mean/std`：除 `absolute_action_slots` 外，未来 chunk 中每个动作都减去 chunk 起点的 current state。
+
+`absolute_action_slots` 只定义 delta 空间中仍保持绝对值的夹爪开合度 slots，并不控制是否生成两套统计；
+缺省为空列表。顶层 `action_mean/std` 继续保留为 absolute 的兼容字段。训练配置用
+`action_type: absolute_joint_position` 或 `action_type: delta_from_current_state`
+选择同一个 norm 文件中的对应字段。只有夹爪开合度应列入 `absolute_action_slots`；
+灵巧手关节仍属于 delta。具有同 target slot state 的其他 active action slot 都会转为 delta；
+速度等 action-only 命令没有可减的 current state，因此保持其原有命令语义，并记录在
+`_meta.passthrough_action_slots`。
+
 脚本会在 `_meta.norm_diagnostics` 中记录每个源维度的 min/max、非有限值计数和归一化后范围。希望在
 CI 或交付检查中直接拦截风险时,加:
 
@@ -221,5 +233,5 @@ python datasets/compute_norm_json.py datasets/<your_lerobot_v3> \
 2. parquet 的 state/action 维度顺序与 mapping 完全一致。
 3. action-only 维度是否需要 `state_source: none` 已确认。
 4. 夹爪、底盘、腰部等有方向或单位约定的维度已人工确认。
-5. `meta/norm.json` 是用当前 mapping 生成的,训练配置的 `norm_stats_path` 指向它。
+5. `meta/norm.json` 是用当前 mapping 生成的；若启用 delta，文件同时包含 abs/delta 字段，训练配置的 `norm_stats_path` 指向它。
 6. `views[].key` 与 parquet 图像列名一致,`views[].role` 与训练配置的角色词表一致。

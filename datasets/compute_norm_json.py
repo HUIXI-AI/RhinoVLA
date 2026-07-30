@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Compute RhinoVLA-compatible LeRobot v3 normalization stats.
 
-The output schema is the compact `norm.json` consumed by the native72 loader:
-`state_mean`, `state_std`, `action_mean`, `action_std`, and `_meta`.
+The output keeps legacy absolute `action_mean/std` fields and always writes
+72D absolute and delta-from-current-state action spaces for native72 mappings.
+`absolute_action_slots` only defines delta-space exceptions such as scalar
+gripper opening; it never controls whether the two spaces are generated.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ DEFAULT_SAFE_HALF_RANGE_THRESHOLD = 0.01
 DEFAULT_NORMALIZED_RANGE_WARNING = 2.0
 DEFAULT_ZERO_CENTER_BALANCE_TOLERANCE = 0.15
 DEFAULT_ZERO_CENTER_MEAN_OFFSET_FRACTION = 0.20
+RHINO72_DIM = 72
 COMMAND_NAME_HINTS = ("velocity", "vel", "cmd", "command", "control")
 METHOD = (
     "quantile-minmax-as-affine (NO clip): "
@@ -551,6 +554,257 @@ def _read_vector_column(files: list[Path], column: str, dim: int) -> np.ndarray:
     return np.concatenate(chunks, axis=0)
 
 
+def _read_scalar_column(files: list[Path], column: str, dtype: Any) -> np.ndarray:
+    try:
+        import pyarrow.parquet as pq
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "pyarrow is required to read LeRobot parquet files; install pyarrow or run in the training env"
+        ) from exc
+
+    chunks: list[np.ndarray] = []
+    for path in files:
+        table = pq.read_table(path, columns=[column])
+        values = np.asarray(table[column].to_pylist(), dtype=dtype).reshape(-1)
+        chunks.append(values)
+    if not chunks:
+        raise ValueError(f"no rows read for column {column}")
+    return np.concatenate(chunks, axis=0)
+
+
+def _apply_mapping_value_transforms(values: np.ndarray, transforms: list[str]) -> np.ndarray:
+    out = np.asarray(values, dtype=np.float32).copy()
+    for index, transform in enumerate(transforms):
+        if transform in ("", "identity", None):
+            continue
+        if transform == "one_minus_raw":
+            out[..., index] = 1.0 - out[..., index]
+            continue
+        raise ValueError(f"unsupported value_transform={transform!r} in combined action norm")
+    return out
+
+
+def _combined_action_mapping_spec(mapping: dict[str, Any]) -> dict[str, Any]:
+    groups = list(mapping.get("native_joint_groups", []) or [])
+    if not groups:
+        raise ValueError("combined absolute/delta norm requires native_joint_groups")
+
+    state_by_slot: dict[int, tuple[int, str]] = {}
+    action_by_slot: dict[int, tuple[int, str]] = {}
+    for group in groups:
+        slots = [int(slot) for slot in (group.get("target_slots") or [])]
+        state_indices = [int(index) for index in (group.get("state_source_indices") or [])]
+        action_indices = [int(index) for index in (group.get("action_source_indices") or [])]
+        transform = str(group.get("value_transform", "identity") or "identity")
+        state_source = str(group.get("state_source", mapping.get("state_source", "observation.state")))
+        if state_source != "none":
+            if len(state_indices) != len(slots):
+                raise ValueError(
+                    f"{group.get('slot_group', '<unknown>')}: state_source_indices length "
+                    f"{len(state_indices)} != target_slots length {len(slots)}"
+                )
+            for slot, source_index in zip(slots, state_indices):
+                state_by_slot[slot] = (source_index, transform)
+        if action_indices:
+            if len(action_indices) != len(slots):
+                raise ValueError(
+                    f"{group.get('slot_group', '<unknown>')}: action_source_indices length "
+                    f"{len(action_indices)} != target_slots length {len(slots)}"
+                )
+            for slot, source_index in zip(slots, action_indices):
+                action_by_slot[slot] = (source_index, transform)
+
+    active_state_slots = sorted(
+        {int(slot) for slot in mapping.get("active_state_slots", state_by_slot.keys())}
+    )
+    active_action_slots = sorted(
+        {int(slot) for slot in mapping.get("active_action_slots", action_by_slot.keys())}
+    )
+    missing_action_mapping = [slot for slot in active_action_slots if slot not in action_by_slot]
+    if missing_action_mapping:
+        raise ValueError(f"active action slots missing native mapping: {missing_action_mapping}")
+
+    configured_absolute = {int(slot) for slot in mapping.get("absolute_action_slots", [])}
+    absolute_slots = sorted(slot for slot in active_action_slots if slot in configured_absolute)
+    relative_candidates = [slot for slot in active_action_slots if slot not in configured_absolute]
+    passthrough_action_slots = [
+        slot for slot in relative_candidates if slot not in state_by_slot or slot not in active_state_slots
+    ]
+    delta_slots = [slot for slot in relative_candidates if slot not in passthrough_action_slots]
+
+    return {
+        "state_by_slot": state_by_slot,
+        "action_by_slot": action_by_slot,
+        "active_action_slots": active_action_slots,
+        "absolute_action_slots": absolute_slots,
+        "delta_from_state_slots": delta_slots,
+        "passthrough_action_slots": passthrough_action_slots,
+    }
+
+
+def _base_episode_chunk_mask(
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    action_horizon: int,
+) -> np.ndarray:
+    n_rows = len(episode_indices)
+    mask = np.zeros(n_rows, dtype=bool)
+    last_start = n_rows - action_horizon + 1
+    if last_start <= 0:
+        return mask
+    end_offset = action_horizon - 1
+    same_episode = episode_indices[:last_start] == episode_indices[end_offset:]
+    contiguous_frames = (frame_indices[end_offset:] - frame_indices[:last_start]) == end_offset
+    mask[:last_start] = same_episode & contiguous_frames
+    return mask
+
+
+def _valid_chunk_start_indices(
+    *,
+    dataset_root: Path,
+    files: list[Path],
+    mapping: dict[str, Any],
+    action_horizon: int,
+) -> np.ndarray:
+    episode_indices = _read_scalar_column(files, "episode_index", np.int64)
+    frame_indices = _read_scalar_column(files, "frame_index", np.int64)
+    valid_mask = _base_episode_chunk_mask(episode_indices, frame_indices, action_horizon)
+    sampling = dict(mapping.get("sampling", {}) or {})
+    mode = str(sampling.get("valid_chunk_filter", "episode_only") or "episode_only").lower()
+
+    if mode == "valid_chunk_start":
+        key = str(sampling.get("valid_chunk_start_key", "valid_chunk_start"))
+        valid_mask &= _read_scalar_column(files, key, np.int64) == 1
+    elif mode == "valid_intervals":
+        import pandas as pd
+
+        configured = sampling.get("valid_intervals_path")
+        interval_path = Path(configured) if configured else dataset_root / "meta" / "episode_valid_intervals.parquet"
+        if not interval_path.exists():
+            raise FileNotFoundError(f"valid_intervals requires sidecar: {interval_path}")
+        intervals = pd.read_parquet(interval_path)
+        interval_mask = np.zeros(len(episode_indices), dtype=bool)
+        by_episode: dict[int, list[tuple[int, int]]] = {}
+        for row in intervals[["episode_index", "start_frame", "end_frame"]].itertuples(index=False):
+            start, end = int(row.start_frame), int(row.end_frame)
+            if end > start:
+                by_episode.setdefault(int(row.episode_index), []).append((start, end))
+        for episode, raw_intervals in by_episode.items():
+            merged: list[list[int]] = []
+            for start, end in sorted(raw_intervals):
+                if not merged or start > merged[-1][1]:
+                    merged.append([start, end])
+                else:
+                    merged[-1][1] = max(merged[-1][1], end)
+            episode_rows = np.nonzero(episode_indices == episode)[0]
+            frames = frame_indices[episode_rows]
+            for start, end in merged:
+                keep = (frames >= start) & ((frames + action_horizon) <= end)
+                interval_mask[episode_rows[keep]] = True
+        valid_mask &= interval_mask
+    elif mode != "episode_only":
+        raise ValueError(
+            "sampling.valid_chunk_filter must be episode_only, valid_chunk_start, "
+            f"or valid_intervals; got {mode!r}"
+        )
+
+    starts = np.nonzero(valid_mask)[0]
+    if starts.size == 0:
+        raise ValueError(f"no valid {action_horizon}-step chunk starts for combined delta norm")
+    return starts
+
+
+def _scatter_active_stats_to_rhino72(
+    *,
+    active_slots: list[int],
+    mean: np.ndarray,
+    std: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    mean72 = np.zeros(RHINO72_DIM, dtype=np.float32)
+    std72 = np.ones(RHINO72_DIM, dtype=np.float32)
+    mean72[active_slots] = np.asarray(mean, dtype=np.float32)
+    std72[active_slots] = np.asarray(std, dtype=np.float32)
+    return mean72, std72
+
+
+def _compute_combined_action_stats(
+    *,
+    dataset_root: Path,
+    files: list[Path],
+    mapping: dict[str, Any],
+    states: np.ndarray,
+    actions: np.ndarray,
+    absolute_source_mean: np.ndarray,
+    absolute_source_std: np.ndarray,
+    safe_half_range_threshold: float,
+) -> dict[str, Any]:
+    spec = _combined_action_mapping_spec(mapping)
+    active_slots = spec["active_action_slots"]
+    action_entries = [spec["action_by_slot"][slot] for slot in active_slots]
+    action_source_indices = [entry[0] for entry in action_entries]
+    action_transforms = [entry[1] for entry in action_entries]
+    action_active = _apply_mapping_value_transforms(
+        actions[:, action_source_indices],
+        action_transforms,
+    )
+
+    abs_mean_active = np.asarray(
+        [absolute_source_mean[source_index] for source_index in action_source_indices],
+        dtype=np.float32,
+    )
+    abs_mean_active = _apply_mapping_value_transforms(abs_mean_active, action_transforms)
+    abs_std_active = np.asarray(
+        [absolute_source_std[source_index] for source_index in action_source_indices],
+        dtype=np.float32,
+    )
+    abs_mean72, abs_std72 = _scatter_active_stats_to_rhino72(
+        active_slots=active_slots,
+        mean=abs_mean_active,
+        std=abs_std_active,
+    )
+
+    action_horizon = int(mapping.get("action_horizon", 30))
+    starts = _valid_chunk_start_indices(
+        dataset_root=dataset_root,
+        files=files,
+        mapping=mapping,
+        action_horizon=action_horizon,
+    )
+    chunk_indices = starts[:, None] + np.arange(action_horizon, dtype=np.int64)[None, :]
+    action_delta_values = action_active[chunk_indices].copy()
+    action_position_by_slot = {slot: position for position, slot in enumerate(active_slots)}
+    for slot in spec["delta_from_state_slots"]:
+        state_source_index, state_transform = spec["state_by_slot"][slot]
+        state_values = _apply_mapping_value_transforms(
+            states[starts, state_source_index][:, None],
+            [state_transform],
+        )[:, 0]
+        action_position = action_position_by_slot[slot]
+        action_delta_values[:, :, action_position] -= state_values[:, None]
+    flat_delta_values = action_delta_values.reshape(-1, len(active_slots))
+    delta_mean_active, delta_std_active = _quantile_affine_stats(
+        flat_delta_values,
+        safe_half_range_threshold,
+    )
+    delta_mean72, delta_std72 = _scatter_active_stats_to_rhino72(
+        active_slots=active_slots,
+        mean=delta_mean_active,
+        std=delta_std_active,
+    )
+    return {
+        "action_abs_mean": abs_mean72,
+        "action_abs_std": abs_std72,
+        "action_delta_mean": delta_mean72,
+        "action_delta_std": delta_std72,
+        "absolute_action_slots": spec["absolute_action_slots"],
+        "delta_from_state_slots": spec["delta_from_state_slots"],
+        "passthrough_action_slots": spec["passthrough_action_slots"],
+        "valid_chunk_starts": int(starts.size),
+        "delta_action_values": int(flat_delta_values.shape[0]),
+        "action_horizon": action_horizon,
+    }
+
+
 def _quantile_affine_stats(values: np.ndarray, safe_half_range_threshold: float) -> tuple[np.ndarray, np.ndarray]:
     p01, p99 = np.quantile(values, [0.01, 0.99], axis=0)
     mean = ((p01 + p99) / 2.0).astype(np.float32)
@@ -592,6 +846,18 @@ def compute_norm_stats(
         "action_std": action_std,
     }
     norm_overrides = _apply_mapping_norm_overrides(stats_arrays, selected_mapping)
+    combined_action_stats: dict[str, Any] | None = None
+    if selected_mapping.get("native_joint_groups"):
+        combined_action_stats = _compute_combined_action_stats(
+            dataset_root=dataset_root,
+            files=files,
+            mapping=selected_mapping,
+            states=states,
+            actions=actions,
+            absolute_source_mean=stats_arrays["action_mean"],
+            absolute_source_std=stats_arrays["action_std"],
+            safe_half_range_threshold=safe_half_range_threshold,
+        )
     norm_diagnostics = _build_norm_diagnostics(
         state_values=states,
         action_values=actions,
@@ -621,13 +887,42 @@ def compute_norm_stats(
     }
     if norm_overrides:
         meta["mapping_norm_overrides"] = norm_overrides
-    return {
+    result = {
         "state_mean": stats_arrays["state_mean"].tolist(),
         "state_std": stats_arrays["state_std"].tolist(),
         "action_mean": stats_arrays["action_mean"].tolist(),
         "action_std": stats_arrays["action_std"].tolist(),
         "_meta": meta,
     }
+    if combined_action_stats is not None:
+        for key in (
+            "action_abs_mean",
+            "action_abs_std",
+            "action_delta_mean",
+            "action_delta_std",
+        ):
+            result[key] = combined_action_stats[key].tolist()
+        meta.update(
+            {
+                "absolute_action_slots": combined_action_stats["absolute_action_slots"],
+                "delta_from_state_slots": combined_action_stats["delta_from_state_slots"],
+                "passthrough_action_slots": combined_action_stats["passthrough_action_slots"],
+                "valid_chunk_starts": combined_action_stats["valid_chunk_starts"],
+                "delta_action_values": combined_action_stats["delta_action_values"],
+                "action_horizon": combined_action_stats["action_horizon"],
+                "action_spaces": {
+                    "absolute_joint_position": {
+                        "mean_key": "action_abs_mean",
+                        "std_key": "action_abs_std",
+                    },
+                    "delta_from_current_state": {
+                        "mean_key": "action_delta_mean",
+                        "std_key": "action_delta_std",
+                    },
+                },
+            }
+        )
+    return result
 
 
 def write_norm_json(stats: dict[str, Any], output_path: str | Path, *, overwrite: bool = False) -> Path:

@@ -44,20 +44,24 @@ RhinoVLA 在辉羲 R1 芯片上实现了 **11.69Hz** 端到端推理频率，跨
 ### 预训练权重
 
 预训练参数统一从 Hugging Face 下载: [HuixiAI/RhinoVLA](https://huggingface.co/HuixiAI/RhinoVLA)。
-Hugging Face 仓库提供默认训练配置使用的 `rhinovla_pretrain.ckpt`。
 也可从 ModelScope 下载: [huixiAI/RhinoVLA](https://www.modelscope.cn/models/huixiAI/RhinoVLA)。
 
-下载到本仓库的 `checkpoints/` 后即可微调。默认配置加载
+将与当前代码结构匹配的预训练权重下载到本仓库的 `checkpoints/` 后即可微调。默认配置加载
 `trainer.pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt`。
 权重的 model card、license 和使用限制以 Hugging Face 仓库页面为准。
+
+## 最新动态
+
+- [2026-07-30] 扩充训练数据和训练步数，支持动态图像宽高比，并优化图像 patch 的 RoPE 位置计算。
+- [2026-07-08] 首次发布 RhinoVLA 预训练权重和微调代码。
 
 ### 仓库结构
 
 - `rhinovla/`：核心 Python 包，包含模型框架、Qwen3-VL 封装、Action Expert、LeRobot 数据加载和训练逻辑。
 - `rhinovla/assets/qwen3_vl_processor/`：本地 Qwen3-VL processor / tokenizer 配置。
-- `configs/training/`：训练配置，包括 Action Expert 微调、全参微调。
+- `configs/training/`：冻结视觉编码器的全参数微调配置。
 - `configs/data_mappings/`：LeRobot v3 原始 state/action 字段到 RhinoVLA 72D slots 的 mapping。
-- `datasets/example_lerobot_v3/`：可直接跑通 `demo_ae_finetune.yaml` 的最小 LeRobot v3 示例数据。
+- `datasets/example_lerobot_v3/`：可直接跑通 `demo_full_finetune.yaml` 的最小 LeRobot v3 示例数据。
 - `checkpoints/`：预训练权重。
 - `scripts/train/`：训练启动脚本。
 - `docs/`：微调说明文档。
