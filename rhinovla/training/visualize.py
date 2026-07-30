@@ -13,7 +13,7 @@ import textwrap
 import io
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -306,10 +306,8 @@ def compact_chat_template_prompt(prompt: str) -> str:
     return re.sub(r"<\|vision_start\|>\s*<\|image_pad\|>\s*<\|vision_end\|>", _replace, str(prompt))
 
 
-def prompt_mode_label(use_view_registry_prompt: bool) -> str:
-    if use_view_registry_prompt:
-        return "72D ViewRegistry prompt: Task + [view_role | modality] before each image"
-    return "raw prompt: <image><image><image> + instruction text"
+def prompt_mode_label() -> str:
+    return "compact View Registry prompt: [view_role|modality] before each image"
 
 
 def _image_from_any(value: Any) -> Image.Image:
@@ -399,6 +397,71 @@ def _tf_error_active_slots_and_labels(mask: np.ndarray, *, action_dim: int) -> t
     return active, labels
 
 
+def _denormalize_tf_error_actions(
+    values: np.ndarray,
+    *,
+    action_mean: np.ndarray,
+    action_std: np.ndarray,
+) -> np.ndarray:
+    """Convert TF-error values from model-normalized to native action units."""
+    values_np = np.asarray(values, dtype=np.float32)
+    mean_np = np.asarray(action_mean, dtype=np.float32).reshape(-1)
+    std_np = np.asarray(action_std, dtype=np.float32).reshape(-1)
+    if values_np.shape[-1] != mean_np.shape[0] or mean_np.shape != std_np.shape:
+        raise ValueError(
+            "TF-error action stats do not match values: "
+            f"values={values_np.shape}, mean={mean_np.shape}, std={std_np.shape}"
+        )
+    return (values_np * std_np + mean_np).astype(np.float32)
+
+
+def _tf_error_actions_to_absolute_units(
+    *,
+    gt_action: np.ndarray,
+    gt_reference_states: np.ndarray,
+    pred_segments: list[tuple[int, np.ndarray]],
+    delta_slots: Sequence[int],
+) -> tuple[np.ndarray, list[tuple[int, np.ndarray]]]:
+    """Restore comparable absolute GT/actions for TF-error visualization.
+
+    Episode GT rows each use their own row state as the delta reference. Each
+    prediction chunk instead uses the state at that chunk's start ``t0``.
+    Gripper and action-only command slots are absent from ``delta_slots`` and
+    therefore remain in their original native units.
+    """
+    gt_abs = np.asarray(gt_action, dtype=np.float32).copy()
+    states = np.asarray(gt_reference_states, dtype=np.float32)
+    if gt_abs.ndim != 2:
+        raise ValueError(f"TF-error GT action must be 2D, got {gt_abs.shape}")
+    if states.ndim == 1:
+        states = np.broadcast_to(states[None, :], gt_abs.shape)
+    if states.ndim != 2 or states.shape != gt_abs.shape:
+        raise ValueError(
+            f"TF-error GT reference states {states.shape} must match actions {gt_abs.shape}"
+        )
+    slots = np.asarray(sorted({int(slot) for slot in delta_slots}), dtype=np.int64)
+    if slots.size:
+        max_slot = int(slots.max())
+        if int(slots.min()) < 0 or max_slot >= gt_abs.shape[1]:
+            raise ValueError(f"TF-error delta slots {slots.tolist()} outside dim {gt_abs.shape[1]}")
+        gt_abs[:, slots] += states[:, slots]
+
+    pred_abs_segments: list[tuple[int, np.ndarray]] = []
+    for t0, segment in pred_segments:
+        start = int(t0)
+        if start < 0 or start >= len(states):
+            raise ValueError(f"TF-error prediction start {start} outside {len(states)} GT rows")
+        segment_abs = np.asarray(segment, dtype=np.float32).copy()
+        if segment_abs.ndim != 2 or segment_abs.shape[1] != gt_abs.shape[1]:
+            raise ValueError(
+                f"TF-error prediction segment {segment_abs.shape} must have dim {gt_abs.shape[1]}"
+            )
+        if slots.size:
+            segment_abs[:, slots] += states[start, slots][None, :]
+        pred_abs_segments.append((start, segment_abs))
+    return gt_abs, pred_abs_segments
+
+
 def _cv2_module():
     try:
         import cv2
@@ -419,21 +482,6 @@ def _canonical_view_key(label: Any, fallback_index: int = 0) -> str:
     return f"view{fallback_index}"
 
 
-def _content_box(raw_img: Image.Image, model_img: Image.Image, mode: str) -> tuple[int, int, int, int]:
-    dst_w, dst_h = model_img.size
-    if mode != "letterbox":
-        return (0, 0, dst_w, dst_h)
-    src_w, src_h = raw_img.size
-    if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
-        return (0, 0, dst_w, dst_h)
-    scale = min(float(dst_w) / float(src_w), float(dst_h) / float(src_h))
-    new_w = max(1, int(round(src_w * scale)))
-    new_h = max(1, int(round(src_h * scale)))
-    x0 = max(0, (dst_w - new_w) // 2)
-    y0 = max(0, (dst_h - new_h) // 2)
-    return (x0, y0, min(dst_w, x0 + new_w), min(dst_h, y0 + new_h))
-
-
 def _normalize_attn(attn: np.ndarray) -> np.ndarray:
     arr = np.asarray(attn, dtype=np.float32)
     if arr.size == 0:
@@ -445,36 +493,6 @@ def _normalize_attn(attn: np.ndarray) -> np.ndarray:
     else:
         arr = np.zeros_like(arr, dtype=np.float32)
     return np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
-
-
-def _crop_attn_to_content(
-    attn: np.ndarray,
-    box: tuple[int, int, int, int],
-    model_size: tuple[int, int],
-) -> np.ndarray:
-    arr = np.asarray(attn, dtype=np.float32)
-    if arr.ndim != 2 or arr.size == 0:
-        return arr
-    model_w, model_h = int(model_size[0]), int(model_size[1])
-    x0, y0, x1, y1 = [int(v) for v in box]
-    if model_w <= 0 or model_h <= 0:
-        return arr
-    x0 = max(0, min(model_w, x0))
-    x1 = max(0, min(model_w, x1))
-    y0 = max(0, min(model_h, y0))
-    y1 = max(0, min(model_h, y1))
-    if x1 <= x0 or y1 <= y0:
-        return arr
-    cv2 = _cv2_module()
-    if arr.shape != (model_h, model_w):
-        if cv2 is not None:
-            arr = cv2.resize(arr, (model_w, model_h), interpolation=cv2.INTER_LINEAR)
-        else:
-            arr = np.asarray(
-                Image.fromarray(_normalize_attn(arr)).resize((model_w, model_h), _RESAMPLE_BILINEAR),
-                dtype=np.float32,
-            )
-    return arr[y0:y1, x0:x1]
 
 
 def _token_grid_lines_for_image(
@@ -491,36 +509,6 @@ def _token_grid_lines_for_image(
     xs = sorted(set(max(0, min(width - 1, x)) for x in xs))
     ys = sorted(set(max(0, min(height - 1, y)) for y in ys))
     return xs, ys
-
-
-def _token_grid_lines_for_raw_image(
-    *,
-    raw_img: Image.Image,
-    model_img: Image.Image,
-    token_grid: tuple[int, int],
-    resize_mode: str,
-) -> tuple[list[int], list[int]]:
-    raw_w, raw_h = raw_img.size
-    model_w, model_h = model_img.size
-    grid_h, grid_w = int(token_grid[0]), int(token_grid[1])
-    if resize_mode != "letterbox":
-        return _token_grid_lines_for_image(image_size=(raw_w, raw_h), token_grid=token_grid)
-    x0, y0, x1, y1 = _content_box(raw_img, model_img, resize_mode)
-    if x1 <= x0 or y1 <= y0 or grid_w <= 0 or grid_h <= 0:
-        return [], []
-    xs: list[int] = []
-    ys: list[int] = []
-    for k in range(grid_w + 1):
-        x_model = float(k) * float(model_w) / float(grid_w)
-        if float(x0) <= x_model <= float(x1):
-            x_raw = int(round((x_model - float(x0)) / float(x1 - x0) * float(raw_w)))
-            xs.append(max(0, min(raw_w - 1, x_raw)))
-    for k in range(grid_h + 1):
-        y_model = float(k) * float(model_h) / float(grid_h)
-        if float(y0) <= y_model <= float(y1):
-            y_raw = int(round((y_model - float(y0)) / float(y1 - y0) * float(raw_h)))
-            ys.append(max(0, min(raw_h - 1, y_raw)))
-    return sorted(set(xs)), sorted(set(ys))
 
 
 def _draw_token_grid(
@@ -707,16 +695,13 @@ def build_action_expert_attention_panel(
     run_id: str = "native72",
     step: int | str = 0,
     framework: str = "RhinoVLA",
-    image_resize_mode: str = "letterbox",
-    view_prompt: bool | str = True,
     ckpt_path: str = "",
     subtitle: str = "",
 ) -> Image.Image:
     """Standard RhinoVLA action-expert attention visualization.
 
-    This mirrors ``live_attention_5ckpt`` exactly: top row is raw-resolution
-    views, bottom row is the model-input letterbox views.  Raw overlays crop
-    away model-input padding before projecting attention back to raw pixels.
+    The top row uses raw-resolution views and the bottom row uses the dynamic
+    model-input geometry. Both preserve image aspect ratio without padding.
     """
 
     if model_images is None:
@@ -750,16 +735,10 @@ def build_action_expert_attention_panel(
         model_img = entry["model"]
         raw_img = entry["raw"]
         token_grid = tuple(int(x) for x in np.asarray(attn).shape[:2])
-        attn_content = _crop_attn_to_content(
-            attn,
-            _content_box(raw_img, model_img, str(image_resize_mode)),
-            model_img.size,
-        )
-        raw_grid_lines = _token_grid_lines_for_raw_image(
-            raw_img=raw_img,
-            model_img=model_img,
+        attn_content = attn
+        raw_grid_lines = _token_grid_lines_for_image(
+            image_size=raw_img.size,
             token_grid=token_grid,
-            resize_mode=str(image_resize_mode),
         )
         model_grid_lines = _token_grid_lines_for_image(image_size=model_img.size, token_grid=token_grid)
         raw_cells.append(
@@ -785,7 +764,7 @@ def build_action_expert_attention_panel(
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (12, 8),
-        f"{tag} {run_id} step={step} | {framework} | {image_resize_mode} | view_prompt={view_prompt}",
+        f"{tag} {run_id} step={step} | {framework} | dynamic-aspect | compact-prompt",
         fill=(255, 255, 255),
         font=_font(18),
     )
@@ -804,6 +783,7 @@ def build_tf_error_panel(
     step: int = 0,
     title: str = "TF-error chunk",
     max_dims: int | None = None,
+    units_label: str = "absolute action units",
 ) -> Image.Image:
     """Fallback TF-error plot using the same style as the episode plot."""
 
@@ -839,7 +819,7 @@ def build_tf_error_panel(
         chunk_len=horizon,
         dim_labels=labels,
         title_prefix=title,
-        units_label="normalized action units",
+        units_label=units_label,
     )
 
 
@@ -1147,24 +1127,6 @@ class _VizMixin:
             image_token_id,
         )
 
-    def _image_resize_mode(self, raw_model=None) -> str:
-        cfg = getattr(raw_model, "config", None) if raw_model is not None else None
-        if cfg is None:
-            cfg = getattr(self, "config", None)
-        try:
-            return str(cfg.datasets.vla_data.get("image_resize_mode", "letterbox"))
-        except Exception:  # noqa: BLE001
-            return "letterbox"
-
-    def _use_view_registry_prompt(self, raw_model=None) -> bool:
-        cfg = getattr(raw_model, "config", None) if raw_model is not None else None
-        if cfg is None:
-            cfg = getattr(self, "config", None)
-        try:
-            return bool(cfg.datasets.vla_data.get("use_view_registry_prompt", True))
-        except Exception:  # noqa: BLE001
-            return True
-
     def _run_id_for_viz(self) -> str:
         return str(getattr(self.config, "run_id", "native72"))
 
@@ -1188,12 +1150,8 @@ class _VizMixin:
     def _log_swanlab_image(self, key: str, path: Path, *, step: int) -> None:
         if not (HAS_SWANLAB and self._swanlab_enabled):
             return
-        aliases = [key]
-        stable_key = "viz_" + str(key).replace("/", "_")
-        if stable_key not in aliases:
-            aliases.append(stable_key)
         try:
-            swanlab.log({name: swanlab.Image(str(path)) for name in aliases}, step=step)
+            swanlab.log({key: swanlab.Image(str(path))}, step=step)
         except Exception as exc:  # noqa: BLE001
             failures = int(getattr(self, "_swanlab_image_log_failures", 0)) + 1
             self._swanlab_image_log_failures = failures
@@ -1228,11 +1186,11 @@ class _VizMixin:
         payloads = [dataset.get_row_payload(row) for row in row_indices]
         frame_ids = np.asarray([int(p.get("frame_index", i)) for i, p in enumerate(payloads)], dtype=np.int64)
         action_raw = np.stack([np.asarray(p["action_raw"], dtype=np.float32) for p in payloads], axis=0)
+        state_raw_rows = np.stack([np.asarray(p["state_raw"], dtype=np.float32) for p in payloads], axis=0)
         first_mask = np.asarray(sample.get("action_mask", np.ones((1, action_raw.shape[-1]))), dtype=np.float32)
         if first_mask.ndim == 2:
             first_mask = first_mask[0]
         active, dim_labels = _tf_error_active_slots_and_labels(first_mask, action_dim=action_raw.shape[-1])
-        gt_action = action_raw[:, active]
 
         state_mean = np.asarray(getattr(dataset, "state_mean"), dtype=np.float32)
         state_std = np.asarray(getattr(dataset, "state_std"), dtype=np.float32)
@@ -1251,10 +1209,7 @@ class _VizMixin:
             payload = payloads[t0]
             raw_images = dataset.decode_frame(row)
             if camera_keys and hasattr(dataset, "_select_image"):
-                model_images = [
-                    dataset._select_image(img, camera_key=key)  # noqa: SLF001
-                    for img, key in zip(raw_images, camera_keys)
-                ]
+                model_images = [dataset._select_image(img) for img in raw_images]  # noqa: SLF001
             else:
                 model_images = [_image_from_any(img) for img in raw_images]
             state_raw = np.asarray(payload["state_raw"], dtype=np.float32)
@@ -1272,11 +1227,23 @@ class _VizMixin:
             with torch.no_grad():
                 pred = raw_model.predict_action([example])
             pred_np = pred.detach().float().cpu().numpy()[0]
-            pred_raw = pred_np * action_std[None, :] + action_mean[None, :]
-            pred_segments.append((int(t0), pred_raw[:, active]))
+            pred_raw = _denormalize_tf_error_actions(
+                pred_np,
+                action_mean=action_mean,
+                action_std=action_std,
+            )
+            pred_segments.append((int(t0), pred_raw))
 
         if not pred_segments:
             return None
+        gt_action_abs, pred_segments_abs = _tf_error_actions_to_absolute_units(
+            gt_action=action_raw,
+            gt_reference_states=state_raw_rows,
+            pred_segments=pred_segments,
+            delta_slots=getattr(dataset, "delta_action_slots", []),
+        )
+        gt_action = gt_action_abs[:, active]
+        pred_segments = [(t0, segment[:, active]) for t0, segment in pred_segments_abs]
         bounds = _collect_segment_bounds(payloads)
         if len(bounds) <= 1:
             bounds = _collect_subtask_bounds(payloads)
@@ -1290,7 +1257,7 @@ class _VizMixin:
             episode_id=str(payload0.get("original_episode_id", "")),
             chunk_len=chunk_len,
             dim_labels=dim_labels,
-            units_label="canonical units",
+            units_label="absolute action units",
         )
 
     def _log_vlm_prompt_cards(self, dataset=None, step: int | None = None):
@@ -1319,13 +1286,12 @@ class _VizMixin:
                 )
                 images = [_image_from_any(img) for img in sample.get("image", [])[:3]]
                 labels = list(sample.get("view_roles") or ["view0", "view1", "view2"])[: len(images)]
-                use_view_registry = bool(raw_model.config.datasets.vla_data.get("use_view_registry_prompt", True))
                 panel = build_vlm_prompt_sample_panel(
                     images=[_image_from_any(img) for img in batch_images[0][:3]] or images,
                     labels=labels,
                     chat_prompt=chat_prompt,
                     tokenized_prompt=tokenized_prompt,
-                    prompt_mode=prompt_mode_label(use_view_registry),
+                    prompt_mode=prompt_mode_label(),
                 )
                 out_path = visual_dir / _indexed_viz_path(
                     "vlm_prompt",
@@ -1372,16 +1338,41 @@ class _VizMixin:
                         with torch.no_grad():
                             pred = raw_model.predict_action([sample])
                         pred_np = pred.detach().float().cpu().numpy()[0]
-                        gt = np.asarray(sample["action"], dtype=np.float32)[-pred_np.shape[0] :, : pred_np.shape[1]]
+                        dataset = getattr(self.vla_train_dataloader, "dataset", None)
+                        action_mean = np.asarray(getattr(dataset, "action_mean"), dtype=np.float32)
+                        action_std = np.asarray(getattr(dataset, "action_std"), dtype=np.float32)
+                        pred_raw = _denormalize_tf_error_actions(
+                            pred_np,
+                            action_mean=action_mean,
+                            action_std=action_std,
+                        )
+                        if sample.get("action_raw") is not None:
+                            gt_raw = np.asarray(sample["action_raw"], dtype=np.float32)
+                        else:
+                            gt_raw = _denormalize_tf_error_actions(
+                                np.asarray(sample["action"], dtype=np.float32),
+                                action_mean=action_mean,
+                                action_std=action_std,
+                            )
+                        gt_raw = gt_raw[-pred_np.shape[0] :, : pred_np.shape[1]]
+                        state_raw = np.asarray(sample["state_raw"], dtype=np.float32).reshape(-1, gt_raw.shape[1])[0]
+                        gt_reference_states = np.broadcast_to(state_raw[None, :], gt_raw.shape)
+                        gt, pred_abs_segments = _tf_error_actions_to_absolute_units(
+                            gt_action=gt_raw,
+                            gt_reference_states=gt_reference_states,
+                            pred_segments=[(0, pred_raw)],
+                            delta_slots=getattr(dataset, "delta_action_slots", []),
+                        )
                         mask = np.asarray(sample.get("action_mask", np.ones_like(gt)), dtype=np.float32)
                         if mask.ndim == 1:
                             mask = np.broadcast_to(mask[None, :], gt.shape)
                         panel = build_tf_error_panel(
-                            pred=pred_np,
+                            pred=pred_abs_segments[0][1],
                             gt=gt,
                             mask=mask,
                             step=self.completed_steps,
                             title="TF chunk inference",
+                            units_label="absolute action units",
                         )
                     out_path = visual_dir / _indexed_viz_path(
                         "tf_error",
@@ -1458,8 +1449,6 @@ class _VizMixin:
                         run_id=self._run_id_for_viz(),
                         step=self.completed_steps,
                         framework=raw_model.__class__.__name__,
-                        image_resize_mode=self._image_resize_mode(raw_model),
-                        view_prompt=self._use_view_registry_prompt(raw_model),
                         ckpt_path=self._ckpt_path_for_viz(),
                         subtitle=f"captured={len(captured)} tensors, image_grids={grid.tolist()}, merge={merge_size}",
                     )

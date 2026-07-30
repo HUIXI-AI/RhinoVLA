@@ -20,7 +20,11 @@ from rhinovla.model.modules.action_expert import (
     RhinoActionExpertConfig,
     estimate_rhino_action_params,
 )
-from rhinovla.training.trainer_utils.trainer_tools import resize_images
+
+
+_BETA_ALPHA = 1.5
+_BETA_BETA = 1.0
+_TIME_EPSILON = 0.001
 
 
 def _rhino_metric_label(value: object, max_len: int = 60) -> str:
@@ -28,6 +32,34 @@ def _rhino_metric_label(value: object, max_len: int = 60) -> str:
     text = str(value).rstrip("/").split("/")[-1]
     safe = "".join(ch if (ch.isalnum() or ch in {"_", "-", "."}) else "_" for ch in text)
     return safe[:max_len] or "unknown"
+
+
+def resolve_prefix_rope_deltas(
+    rope_deltas: Tensor | None,
+    *,
+    has_vision_prefix: bool,
+    batch_size: int,
+    device: torch.device,
+) -> Tensor:
+    """Validate Qwen3-VL's continuation offset for the multimodal prefix."""
+    if rope_deltas is None:
+        if has_vision_prefix:
+            raise RuntimeError(
+                "Qwen3-VL multimodal prefix did not return rope_deltas; "
+                "action RoPE positions would be incorrect"
+            )
+        return torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+    if not isinstance(rope_deltas, Tensor):
+        raise TypeError(f"rope_deltas must be a Tensor, got {type(rope_deltas)}")
+    if rope_deltas.dtype != torch.long:
+        raise TypeError(f"rope_deltas must have dtype torch.long, got {rope_deltas.dtype}")
+    if rope_deltas.ndim == 1:
+        rope_deltas = rope_deltas[:, None]
+    if tuple(rope_deltas.shape) != (batch_size, 1):
+        raise ValueError(
+            f"rope_deltas must have shape {(batch_size, 1)}, got {tuple(rope_deltas.shape)}"
+        )
+    return rope_deltas.to(device=device)
 
 
 class RhinoVLA(nn.Module):
@@ -117,20 +149,7 @@ class RhinoVLA(nn.Module):
                     param.requires_grad = False
                 print("[Rhino] froze Qwen visual encoder", flush=True)
 
-        self.beta_alpha = float(getattr(action_cfg, "noise_beta_alpha", 1.5))
-        self.beta_beta = float(getattr(action_cfg, "noise_beta_beta", 1.0))
         self.num_inference_timesteps = int(getattr(action_cfg, "num_inference_timesteps", 10))
-        # Flow time convention. Default "openpi" (x_t=t*noise+(1-t)*action, t:1->0,
-        # target=noise-action) preserves the deployed D recipe. "rhinovla" mirrors it
-        # (x_t=(1-t)*noise+t*action, t:0->1, target=action-noise) so a Rhino run shares
-        # RhinoVLA's t-meaning; pair with Beta(1.0,1.5) to oversample high noise (t->0).
-        # The flip is applied consistently in forward()/predict_action() (and thus TF-eval
-        # + attention-GIF, which both call predict_action) so train/infer stay identical.
-        self.flow_time_convention = str(getattr(action_cfg, "flow_time_convention", "openpi")).lower()
-        if self.flow_time_convention not in ("openpi", "rhinovla"):
-            raise ValueError(
-                f"flow_time_convention must be 'openpi' or 'rhinovla', got {self.flow_time_convention!r}"
-            )
 
         # Grasp weighting: per-sample + temporal + phase-dim weights
         gw = getattr(action_cfg, "grasp_weighting", None)
@@ -303,22 +322,6 @@ class RhinoVLA(nn.Module):
         instructions = [example["lang"] for example in examples]
         view_roles = [example.get("view_roles") for example in examples]
         view_modalities = [example.get("view_modalities") for example in examples]
-        # pre_resize_images: resize images before passing to Qwen processor.
-        # Default False — aligned with Qwen3-VL official: data pipeline provides
-        # ≥256x256 images and Qwen processor handles smart_resize internally
-        # via framework.qwenvl.image_min/max_pixels. Old 224 resize path is gone.
-        # Set to True only for legacy 224 configs that really need explicit resize.
-        pre_resize = bool(getattr(self.config.datasets.vla_data, "pre_resize_images", False))
-        if pre_resize:
-            train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
-            if train_obs_image_size:
-                from omegaconf import OmegaConf
-                image_size_container = OmegaConf.to_container(train_obs_image_size, resolve=True)
-                if isinstance(image_size_container, (list, tuple)):
-                    target_size = (int(image_size_container[0]), int(image_size_container[1]))
-                else:
-                    target_size = (int(image_size_container), int(image_size_container))
-                batch_images = resize_images(batch_images, target_size=target_size)
         return batch_images, instructions, view_roles, view_modalities
 
     def _encode_prefix(self, examples: List[dict]):
@@ -332,7 +335,7 @@ class RhinoVLA(nn.Module):
         # Fast path: when preprocess_qwen_in_dataloader=true, the dataloader worker already ran the
         # Qwen processor (apply_chat_template) and stashed the CPU inputs on examples[0]["_qwen_inputs_cpu"],
         # moving the dominant processor cost off the forward critical path (hidden by prefetch). Only the
-        # H2D copy remains here. When absent (default/legacy), fall back to the in-forward processor call.
+        # H2D copy remains here. When absent, fall back to the in-forward processor call.
         precomputed = examples[0].get("_qwen_inputs_cpu") if examples else None
         if precomputed is not None:
             qwen_inputs = precomputed.to(device, non_blocking=True)
@@ -413,17 +416,29 @@ class RhinoVLA(nn.Module):
                     for key, value in getattr(self.qwen, "_last_input_timing", {}).items()
                 }
             )
-        return outputs.past_key_values, prefix_mask
+        prefix_rope_deltas = resolve_prefix_rope_deltas(
+            getattr(outputs, "rope_deltas", None),
+            has_vision_prefix=model_inputs.get("pixel_values") is not None,
+            batch_size=prefix_mask.shape[0],
+            device=prefix_mask.device,
+        )
+        return outputs.past_key_values, prefix_mask, prefix_rope_deltas
 
     def sample_noise(self, shape, device):
         return torch.randn(shape, dtype=torch.float32, device=device)
 
     def sample_time(self, batch_size, device):
         dist = torch.distributions.Beta(
-            torch.tensor(self.beta_alpha, dtype=torch.float32, device=device),
-            torch.tensor(self.beta_beta, dtype=torch.float32, device=device),
+            torch.tensor(_BETA_ALPHA, dtype=torch.float32, device=device),
+            torch.tensor(_BETA_BETA, dtype=torch.float32, device=device),
         )
-        return (dist.sample((batch_size,)) * 0.999).to(torch.float32)
+        sample = dist.sample((batch_size,)) * (1.0 - _TIME_EPSILON) + _TIME_EPSILON
+        below_one = torch.nextafter(
+            torch.ones((), dtype=torch.float32, device=device),
+            torch.zeros((), dtype=torch.float32, device=device),
+        )
+        sample = sample.clamp(min=_TIME_EPSILON, max=below_one)
+        return sample.to(torch.float32)
 
     def _prepare_masked_actions(self, examples: List[dict], device: torch.device) -> tuple[Tensor, Tensor]:
         actions = torch.as_tensor(np.asarray([ex["action"] for ex in examples]), dtype=torch.float32).to(
@@ -478,6 +493,7 @@ class RhinoVLA(nn.Module):
         self,
         prefix_key_values,
         prefix_mask: Tensor,
+        prefix_rope_deltas: Tensor,
         state: Tensor | None,
         state_mask: Tensor | None,
         x_t: Tensor,
@@ -487,6 +503,7 @@ class RhinoVLA(nn.Module):
         return self.action_expert(
             prefix_key_values=prefix_key_values,
             prefix_mask=prefix_mask,
+            prefix_rope_deltas=prefix_rope_deltas,
             state=state,
             state_mask=state_mask,
             x_t=x_t,
@@ -502,21 +519,18 @@ class RhinoVLA(nn.Module):
 
         actions, action_mask = self._prepare_masked_actions(examples, device)
         state, state_mask = self._prepare_masked_state(examples, device)
-        prefix_key_values, prefix_mask = self._encode_prefix(examples)
+        prefix_key_values, prefix_mask, prefix_rope_deltas = self._encode_prefix(examples)
 
         noise = self.sample_noise(actions.shape, actions.device) * action_mask
         time = self.sample_time(actions.shape[0], actions.device)
         t = time[:, None, None]
-        if self.flow_time_convention == "rhinovla":
-            x_t = ((1 - t) * noise + t * actions) * action_mask
-            target_velocity = (actions - noise) * action_mask
-        else:
-            x_t = (t * noise + (1 - t) * actions) * action_mask
-            target_velocity = (noise - actions) * action_mask
+        x_t = (t * noise + (1 - t) * actions) * action_mask
+        target_velocity = (noise - actions) * action_mask
 
         pred_velocity = self._action_forward_masked(
             prefix_key_values,
             prefix_mask,
+            prefix_rope_deltas,
             state,
             state_mask,
             x_t,
@@ -567,7 +581,7 @@ class RhinoVLA(nn.Module):
         if not examples:
             raise ValueError("examples must be a non-empty list")
         device = next(self.parameters()).device
-        prefix_key_values, prefix_mask = self._encode_prefix(examples)
+        prefix_key_values, prefix_mask, prefix_rope_deltas = self._encode_prefix(examples)
         bsz = prefix_mask.shape[0]
 
         state, state_mask = self._prepare_masked_state(examples, device)
@@ -585,34 +599,19 @@ class RhinoVLA(nn.Module):
 
         steps = int(num_steps or self.num_inference_timesteps)
         x_t = self.sample_noise((bsz, self.action_horizon, self.action_dim), device=device) * action_mask
-        if self.flow_time_convention == "rhinovla":
-            dt = 1.0 / steps
-            time = torch.zeros(bsz, dtype=torch.float32, device=device)
-            for _ in range(steps):
-                pred_velocity = self._action_forward_masked(
-                    prefix_key_values,
-                    prefix_mask,
-                    state,
-                    state_mask,
-                    x_t,
-                    action_mask_full,
-                    time,
-                )
-                x_t = (x_t + dt * pred_velocity) * action_mask
-                time = (time + dt).clamp(max=1.0)
-        else:
-            dt = -1.0 / steps
-            time = torch.ones(bsz, dtype=torch.float32, device=device)
-            for _ in range(steps):
-                pred_velocity = self._action_forward_masked(
-                    prefix_key_values,
-                    prefix_mask,
-                    state,
-                    state_mask,
-                    x_t,
-                    action_mask_full,
-                    time,
-                )
-                x_t = (x_t + dt * pred_velocity) * action_mask
-                time = (time + dt).clamp(min=0.0)
+        dt = -1.0 / steps
+        time = torch.ones(bsz, dtype=torch.float32, device=device)
+        for _ in range(steps):
+            pred_velocity = self._action_forward_masked(
+                prefix_key_values,
+                prefix_mask,
+                prefix_rope_deltas,
+                state,
+                state_mask,
+                x_t,
+                action_mask_full,
+                time,
+            )
+            x_t = (x_t + dt * pred_velocity) * action_mask
+            time = (time + dt).clamp(min=0.0)
         return x_t

@@ -433,7 +433,12 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
                 "state_dim": int(vla_cfg.get("state_dim", 0)),
                 "image_size": list(vla_cfg.get("image_size", [])) if hasattr(vla_cfg.get("image_size", []), "__iter__") else [int(vla_cfg.get("image_size", 0))],
             }
-            for key in ("action_abs_mean", "action_abs_std", "action_delta_from_state_dims"):
+            for key in (
+                "action_abs_mean",
+                "action_abs_std",
+                "action_delta_from_state_dims",
+                "absolute_action_slots",
+            ):
                 val = vla_cfg.get(key, None)
                 if val is not None:
                     payload[key] = list(val) if hasattr(val, "__iter__") and not isinstance(val, str) else val

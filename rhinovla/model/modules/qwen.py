@@ -87,7 +87,6 @@ def _build_qwenvl_messages_cpu(
     solutions=None,
     view_roles=None,
     view_modalities=None,
-    use_view_prompt: bool = True,
     allowed_roles=_DEFAULT_VIEW_ROLE_VOCAB,
     allowed_modalities=_DEFAULT_VIEW_MODALITY_VOCAB,
     cot_prompt=None,
@@ -111,24 +110,21 @@ def _build_qwenvl_messages_cpu(
         else:
             prompt = instruction
 
-        if use_view_prompt:
-            content.append({"type": "text", "text": f"Task: {prompt}\n\nViews:"})
-            roles = (view_roles or [None] * len(images))[sample_idx] or []
-            modalities = (view_modalities or [None] * len(images))[sample_idx] or []
-            for image_idx, img in enumerate(imgs):
-                role = str(roles[image_idx]) if image_idx < len(roles) else ("front" if image_idx == 0 else "external")
-                modality = str(modalities[image_idx]) if image_idx < len(modalities) else "rgb"
-                if role not in allowed_roles:
-                    raise ValueError(f"Unknown view role '{role}'. Allowed roles: {sorted(allowed_roles)}")
-                if modality not in allowed_modalities:
-                    raise ValueError(
-                        f"Unknown view modality '{modality}'. Allowed modalities: {sorted(allowed_modalities)}"
-                    )
-                content.append({"type": "text", "text": f"[{role} | {modality}]"})
-                content.append({"type": "image", "image": img})
-        else:
-            content = [{"type": "image", "image": img} for img in imgs]
-            content.append({"type": "text", "text": prompt})
+        roles = (view_roles or [None] * len(images))[sample_idx] or []
+        modalities = (view_modalities or [None] * len(images))[sample_idx] or []
+        for image_idx, img in enumerate(imgs):
+            role = str(roles[image_idx]) if image_idx < len(roles) else ("front" if image_idx == 0 else "external")
+            modality = str(modalities[image_idx]) if image_idx < len(modalities) else "rgb"
+            if role not in allowed_roles:
+                raise ValueError(f"Unknown view role '{role}'. Allowed roles: {sorted(allowed_roles)}")
+            if modality not in allowed_modalities:
+                raise ValueError(
+                    f"Unknown view modality '{modality}'. Allowed modalities: {sorted(allowed_modalities)}"
+                )
+            newline = "" if image_idx == 0 else "\n"
+            content.append({"type": "text", "text": f"{newline}[{role}|{modality}]"})
+            content.append({"type": "image", "image": img})
+        content.append({"type": "text", "text": f"\n{prompt}"})
         msg = [{"role": "user", "content": content}]
 
         if solutions is not None:
@@ -146,7 +142,6 @@ def build_qwenvl_cpu_inputs(
     solutions=None,
     view_roles=None,
     view_modalities=None,
-    use_view_prompt: bool = True,
     allowed_roles=_DEFAULT_VIEW_ROLE_VOCAB,
     allowed_modalities=_DEFAULT_VIEW_MODALITY_VOCAB,
     cot_prompt=None,
@@ -167,7 +162,6 @@ def build_qwenvl_cpu_inputs(
         solutions=solutions,
         view_roles=view_roles,
         view_modalities=view_modalities,
-        use_view_prompt=use_view_prompt,
         allowed_roles=allowed_roles,
         allowed_modalities=allowed_modalities,
         cot_prompt=cot_prompt,
@@ -339,7 +333,6 @@ class Qwen(nn.Module):
             solutions=solutions,
             view_roles=view_roles,
             view_modalities=view_modalities,
-            use_view_prompt=bool(vla_data.get("use_view_registry_prompt", True)),
             allowed_roles=vla_data.get("view_role_vocab", _DEFAULT_VIEW_ROLE_VOCAB),
             allowed_modalities=vla_data.get("view_modality_vocab", _DEFAULT_VIEW_MODALITY_VOCAB),
             cot_prompt=vla_data.get("CoT_prompt", "") if "CoT_prompt" in vla_data else None,
@@ -366,7 +359,6 @@ class Qwen(nn.Module):
             solutions=solutions,
             view_roles=kwargs.get("view_roles"),
             view_modalities=kwargs.get("view_modalities"),
-            use_view_prompt=bool(vla_data.get("use_view_registry_prompt", True)),
             allowed_roles=vla_data.get("view_role_vocab", _DEFAULT_VIEW_ROLE_VOCAB),
             allowed_modalities=vla_data.get("view_modality_vocab", _DEFAULT_VIEW_MODALITY_VOCAB),
             cot_prompt=vla_data.get("CoT_prompt", "") if "CoT_prompt" in vla_data else None,

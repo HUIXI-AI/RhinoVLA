@@ -4,7 +4,7 @@
 
 当前保留的训练配置示例：
 
-- `configs/training/demo_ae_finetune.yaml`：使用仓库自带的 `datasets/example_lerobot_v3`，batch size 1，用于验证完整链路能启动。
+- `configs/training/demo_full_finetune.yaml`：使用仓库自带的 `datasets/example_lerobot_v3`，冻结视觉 encoder，同时训练 Qwen 语言层和 Action Expert。
 
 对应保留的 mapping 示例：
 
@@ -12,13 +12,25 @@
 
 ## 快速启动 Demo
 
-先从 Hugging Face 下载 `checkpoints/rhinovla_pretrain.ckpt`，然后运行：
+将与当前代码结构匹配的预训练权重放到
+`checkpoints/rhinovla_pretrain.ckpt`，然后运行：
 
 ```bash
 ./scripts/train/demo_train.sh
 ```
 
-脚本只做三件事：进入仓库根目录、检查 `checkpoints/rhinovla_pretrain.ckpt`、启动 `configs/training/demo_ae_finetune.yaml`。默认不启用 SwanLab，只写本地 `outputs/demo_train/**/metrics.jsonl`。
+示例默认使用 `absolute_joint_position`，也支持
+`delta_from_current_state`。例如：
+
+```bash
+./scripts/train/demo_train.sh \
+  datasets.vla_data.action_type=delta_from_current_state \
+  datasets.vla_data.norm_stats_path=/path/to/combined_norm.json
+```
+
+delta 模式仍要求 combined norm 中存在 `action_delta_mean/std`，且 slot metadata 与 mapping
+一致。若 checkpoint 位于其他位置，通过 `CHECKPOINT=/path/to/model.ckpt`
+覆盖，不需要修改 YAML。
 
 如果要上报 SwanLab：
 
@@ -115,6 +127,7 @@ native_joint_groups:
 - `views`
 - `state_source`、`action_source`
 - `active_state_slots`、`active_action_slots`
+- `absolute_action_slots`：delta 模式下仍保持绝对值的夹爪开合度 slots；灵巧手关节不要放入这里
 - `native_joint_groups`
 - `instruction`
 - `sampling`
@@ -147,7 +160,9 @@ rhino72_action[target_slots] = action_selected
 
 `demo_lerobot_native72.yaml` 使用 `datasets + native_joint_groups` 结构；后续新增机器人也按这套结构扩展，不再新增第二种 mapping 形态。
 
-夹爪维度和其他维度一样处理：不做额外开合方向变换，不单独缩放，直接按 `norm.json` 里的 quantile p01/p99 no-clip 统计归一化。
+夹爪开合度不做额外方向变换或单独缩放。absolute 模式下所有 action 都是绝对值；
+`delta_from_current_state` 模式下只有 mapping 的 `absolute_action_slots`（夹爪开合度）保持绝对值，
+其余 active action（包括灵巧手关节）均减去 chunk 起点的 current state。
 
 ## Norm 文件
 
@@ -169,6 +184,8 @@ std < 0.01 的维度用 1.0
 ```
 
 dataloader 会把源维度 norm stats 按 mapping 扩展到 72D；未激活 slot 的 mean=0、std=1。
+脚本每次默认同时写出 `action_abs_mean/std` 和 `action_delta_mean/std`，
+`absolute_action_slots` 只决定 delta 空间中哪些夹爪开合度 slots 保持绝对值。两种训练模式共享一个文件。
 
 ## 训练配置
 
@@ -179,8 +196,8 @@ framework:
   name: RhinoVLA
   qwenvl:
     base_vlm: rhinovla/assets/qwen3_vl_processor
-    freeze_qwen: true
-    freeze_vision: false
+    freeze_qwen: false
+    freeze_vision: true
 
 datasets:
   vla_data:
@@ -188,8 +205,7 @@ datasets:
     mapping_path: configs/data_mappings/demo_lerobot_native72.yaml
     mapping_dataset_id: example_lerobot_v3
     norm_stats_path: datasets/example_lerobot_v3/meta/norm.json
-    image_resize_mode: letterbox
-    use_view_registry_prompt: true
+    action_type: absolute_joint_position  # 或 delta_from_current_state
 
 trainer:
   pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt
@@ -197,25 +213,20 @@ trainer:
 
 `base_vlm` 指向仓库内 Qwen3-VL config/tokenizer/processor asset，用来构建模型结构和图文预处理；它不包含、也不会加载官方 Qwen3-VL 权重。微调权重来自 `trainer.pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt`。
 
-`use_view_registry_prompt` 控制图文组合方式：
+图文输入固定使用 compact View Registry prompt。数据配置需要按相机顺序提供
+`view_roles` 和 `view_modalities`，无需额外开关。
 
-- `true`：使用 RhinoVLA 预训练一致的 View Registry prompt，需要配置 `view_roles` 和 `view_modalities`。
-- `false`：使用裸 `<图><图><图> + instruction` prompt。
+## 训练范围
 
-## 解冻模式
+`framework.qwenvl.freeze_qwen: false` 且 `framework.qwenvl.freeze_vision: true`，VLM 里除了视觉 encoder/VIT 外都参与训练，同时训练 Action Expert。
 
-支持两种训练模式：
-
-- `ae_only`：默认微调模式。`framework.qwenvl.freeze_qwen: true`，只训练 ActionExpert/action IO/projector。
-- `full`：`framework.qwenvl.freeze_qwen: false` 且 `framework.qwenvl.freeze_vision: true`，VLM 里除了视觉 encoder/VIT 外都参与训练，同时训练 ActionExpert。
-
-`trainer.pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt` 是 RhinoVLA 50K 预训练 ckpt 转成当前结构后的 strict-load 权重。
+`trainer.pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt` 必须是与当前模型结构匹配、可 strict-load 的预训练权重。
 
 ## 使用流程清单
 
 1. 准备 LeRobot v3 数据集目录，确认 parquet 里有 state/action、相机列、episode/frame/timestamp/task 字段。
 2. 按数据集真实向量顺序编写 `configs/data_mappings/<robot>.yaml`，把源 index 映射到 72D slots。
 3. 用 `datasets/compute_norm_json.py` 生成 `meta/norm.json`。
-4. 复制或修改 `configs/training/demo_ae_finetune.yaml`，配置 `mapping_path`、`mapping_dataset_id`、`norm_stats_path`、batch size、解冻模式和日志。
+4. 复制或修改 `configs/training/demo_full_finetune.yaml`，配置 `mapping_path`、`mapping_dataset_id`、`norm_stats_path`、batch size 和日志。
 5. 确认 `checkpoints/rhinovla_pretrain.ckpt` 存在。
 6. 启动训练：`python -m rhinovla.training.train --config_yaml configs/training/<your_config>.yaml`，或参考 `scripts/train/demo_train.sh` 写自己的启动脚本。
