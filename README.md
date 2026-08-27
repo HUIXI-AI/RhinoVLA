@@ -52,6 +52,7 @@ RhinoVLA 在辉羲 R1 芯片上实现了 **11.69Hz** 端到端推理频率，跨
 
 ## 最新动态
 
+- [2026-08-27] 支持 Training RTC（[Training-Time Action Conditioning for Efficient Real-Time Chunking](https://www.alphaxiv.org/pdf/2512.05964)）；训练配置通过 `framework.action_expert.training_time_rtc.max_delay` 指定最大 prefix 长度（训练时在 0 到该值之间采样）。
 - [2026-07-30] 扩充训练数据和训练步数，支持动态图像宽高比，并优化图像 patch 的 RoPE 位置计算。
 - [2026-07-08] 首次发布 RhinoVLA 预训练权重和微调代码。
 
