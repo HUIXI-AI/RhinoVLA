@@ -141,6 +141,24 @@ import torch.distributed as dist
 
 class TrainerUtils:
     @staticmethod
+    def configure_torch_compile(model, enabled=False):
+        """Optionally compile only the Action Expert forward call.
+
+        Keeping the module object itself intact is important: replacing the
+        module with an ``OptimizedModule`` changes checkpoint namespaces to
+        ``_orig_mod.*`` and makes strict load/resume unnecessarily fragile.
+        Qwen, the vision tower, data loading, and checkpoint I/O stay eager.
+        """
+        if not enabled:
+            return model
+        if not hasattr(model, "action_expert"):
+            raise ValueError("action_expert is required for trainer.compile_action_expert")
+        model.action_expert.forward = torch.compile(model.action_expert.forward, dynamic=True)
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
+            print("Enabled torch.compile for action_expert.forward", flush=True)
+        return model
+
+    @staticmethod
     def freeze_backbones(model, freeze_modules=""):
         """
         directly freeze the specified submodules based on the relative module path list (patterns), no longer recursively find all submodule names:

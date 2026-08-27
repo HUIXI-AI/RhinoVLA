@@ -20,6 +20,10 @@ Per `docs/LEROBOT_DATA_PIPELINE.md`:
 from __future__ import annotations
 
 import json
+from importlib import import_module
+import os
+from bisect import bisect_right
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -29,7 +33,7 @@ import torch
 from omegaconf import OmegaConf
 from PIL import Image
 from qwen_vl_utils.vision_process import smart_resize as qwen_smart_resize
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, WeightedRandomSampler
 
 
 RHINO72_DIM = 72
@@ -76,6 +80,55 @@ class Native72Mapping:
     loss: dict[str, Any]
 
 
+def _build_qwen_cpu_inputs(*args, **kwargs):
+    """Lazily import the shared CPU-only Qwen preprocessing routine."""
+    from rhinovla.model.modules.qwen import build_qwenvl_cpu_inputs
+
+    return build_qwenvl_cpu_inputs(*args, **kwargs)
+
+
+@dataclass
+class QwenCPUPreprocessCollator:
+    """Build one CPU Qwen batch in a DataLoader worker, preserving model input parity."""
+
+    processor: Any
+    allowed_roles: tuple[str, ...]
+    allowed_modalities: tuple[str, ...]
+    cot_prompt: str | None
+    cot_prompt_present: bool
+
+    def __call__(self, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not batch:
+            return batch
+        batch[0]["_qwen_inputs_cpu"] = _build_qwen_cpu_inputs(
+            self.processor,
+            [example["image"] for example in batch],
+            [example["lang"] for example in batch],
+            view_roles=[example.get("view_roles") for example in batch],
+            view_modalities=[example.get("view_modalities") for example in batch],
+            allowed_roles=self.allowed_roles,
+            allowed_modalities=self.allowed_modalities,
+            cot_prompt=self.cot_prompt,
+            cot_prompt_present=self.cot_prompt_present,
+        )
+        return batch
+
+
+def build_qwen_cpu_preprocess_collator(vla_cfg: Mapping[str, Any], *, processor: Any) -> QwenCPUPreprocessCollator:
+    """Create a worker collator with exactly the model's Qwen prompt settings."""
+    from rhinovla.model.modules.qwen import _DEFAULT_VIEW_MODALITY_VOCAB, _DEFAULT_VIEW_ROLE_VOCAB
+
+    return QwenCPUPreprocessCollator(
+        processor=processor,
+        allowed_roles=tuple(str(value) for value in vla_cfg.get("view_role_vocab", _DEFAULT_VIEW_ROLE_VOCAB)),
+        allowed_modalities=tuple(
+            str(value) for value in vla_cfg.get("view_modality_vocab", _DEFAULT_VIEW_MODALITY_VOCAB)
+        ),
+        cot_prompt=str(vla_cfg.get("CoT_prompt", "")) if "CoT_prompt" in vla_cfg else None,
+        cot_prompt_present="CoT_prompt" in vla_cfg,
+    )
+
+
 def qwen16_reference_slots() -> List[int]:
     """T3 16D order -> RhinoVLA first-16 slot layout.
 
@@ -98,6 +151,146 @@ def _lazy_lerobot_dataset_cls():
     except ModuleNotFoundError:
         from lerobot.common.datasets.lerobot_dataset import LeRobotDataset  # 0.1.x  # noqa: WPS433
     return LeRobotDataset
+
+
+def _is_lerobot_frame_timestamp_error(exc: Exception) -> bool:
+    """Return whether *exc* is the optional LeRobot timestamp exception.
+
+    LeRobot has shipped both module layouts.  Resolve its concrete class only
+    on the exceptional path, rather than recognizing arbitrary same-named
+    exceptions or making LeRobot a module-import dependency.
+    """
+
+    exception_types = []
+    for module_name in (
+        "lerobot.datasets.video_utils",
+        "lerobot.common.datasets.video_utils",
+    ):
+        try:
+            exception_type = getattr(import_module(module_name), "FrameTimestampError")
+        except (ModuleNotFoundError, AttributeError):
+            continue
+        if isinstance(exception_type, type) and issubclass(exception_type, Exception):
+            exception_types.append(exception_type)
+    return bool(exception_types) and isinstance(exc, tuple(exception_types))
+
+
+def wrap_lerobot_pyav_seek_decoder(decoder, *, backoff_s: float = 1.0):
+    """Recover PyAV keyframe-only seek failures with a discarded anchor frame.
+
+    A pre-emptive anchor is incorrect: depending on the source GOP, it can
+    itself move torchvision's PyAV reader to a later keyframe.  Preserve the
+    direct request first, and retry with one earlier frame only for LeRobot's
+    ``FrameTimestampError``.  The retry frame is discarded, so the returned
+    tensor stays aligned exactly to the requested timestamps.
+    """
+
+    def decode(video_path, timestamps, tolerance_s, backend=None):
+        requested = list(timestamps)
+        if backend != "pyav" or not requested:
+            return decoder(video_path, requested, tolerance_s, backend)
+        try:
+            return decoder(video_path, requested, tolerance_s, backend)
+        except Exception as exc:
+            if not _is_lerobot_frame_timestamp_error(exc):
+                raise
+            first_timestamp = min(float(timestamp) for timestamp in requested)
+            anchor = max(0.0, first_timestamp - float(backoff_s))
+            if anchor >= first_timestamp:
+                raise
+            frames = decoder(video_path, [anchor, *requested], tolerance_s, backend)
+            if len(frames) != len(requested) + 1:
+                raise RuntimeError("PyAV seek-anchor decoder returned an unexpected frame count")
+            return frames[1:]
+
+    return decode
+
+
+def _install_lerobot_pyav_seek_workaround() -> None:
+    """Install the process-local exact-timestamp workaround once."""
+
+    try:
+        from lerobot.datasets import dataset_reader  # noqa: WPS433
+    except ModuleNotFoundError:
+        return
+    if getattr(dataset_reader, "_rhinovla_pyav_seek_workaround", False):
+        return
+    dataset_reader.decode_video_frames = wrap_lerobot_pyav_seek_decoder(dataset_reader.decode_video_frames)
+    dataset_reader._rhinovla_pyav_seek_workaround = True
+
+
+class _TorchCodecPathSource:
+    """No-op cache companion for a path-backed TorchCodec decoder."""
+
+    def close(self) -> None:
+        return None
+
+
+TORCHCODEC_EXACT_DECODER_CACHE_MAX_SIZE = 32
+
+
+def _close_torchcodec_cached_decoder(decoder: Any, source: Any) -> None:
+    """Release an evicted path decoder when the backend exposes a closer."""
+    close_decoder = getattr(decoder, "close", None)
+    if callable(close_decoder):
+        close_decoder()
+    close_source = getattr(source, "close", None)
+    if callable(close_source):
+        close_source()
+
+
+def get_torchcodec_exact_cached_decoder(
+    cache,
+    video_path,
+    decoder_cls,
+    *,
+    max_size: int = TORCHCODEC_EXACT_DECODER_CACHE_MAX_SIZE,
+):
+    """Cache an exact-seek TorchCodec decoder for a local video path.
+
+    LeRobot 0.5's default cache passes an fsspec file object to TorchCodec with
+    approximate seeking.  For the local LeRobot releases used here that can
+    select the wrong 30 Hz frame despite valid PTS, use the filesystem path and
+    TorchCodec's exact frame-index seeking instead.
+    """
+
+    if max_size < 1:
+        raise ValueError(f"TorchCodec decoder cache size must be positive, got {max_size}")
+    key = str(video_path)
+    with cache._lock:
+        cached = cache._cache.pop(key, None)
+        if cached is not None:
+            cache._cache[key] = cached
+            return cached[0]
+        while len(cache._cache) >= max_size:
+            oldest_key = next(iter(cache._cache))
+            evicted_decoder, evicted_source = cache._cache.pop(oldest_key)
+            _close_torchcodec_cached_decoder(evicted_decoder, evicted_source)
+        decoder = decoder_cls(key, seek_mode="exact")
+        cache._cache[key] = (decoder, _TorchCodecPathSource())
+        return decoder
+
+
+def _install_lerobot_torchcodec_exact_decoder() -> None:
+    """Use exact local-path TorchCodec decoders in LeRobot's shared cache."""
+
+    try:
+        from lerobot.datasets import video_utils  # noqa: WPS433
+        from torchcodec.decoders import VideoDecoder  # noqa: WPS433
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "video_backend=torchcodec requires importable TorchCodec in the training environment"
+        ) from exc
+    cache_cls = video_utils.VideoDecoderCache
+    if getattr(cache_cls, "_rhinovla_exact_path_decoder", False):
+        return
+    video_utils._default_decoder_cache.clear()
+
+    def get_decoder(cache, video_path):
+        return get_torchcodec_exact_cached_decoder(cache, video_path, VideoDecoder)
+
+    cache_cls.get_decoder = get_decoder
+    cache_cls._rhinovla_exact_path_decoder = True
 
 
 def _load_mapping(path: str | Path) -> dict[str, Any]:
@@ -569,6 +762,141 @@ def _load_weight_override_table(path: str | Path):
     raise ValueError(f"unsupported sample_weight_override_path suffix: {path}")
 
 
+class Native72MixtureDataset(ConcatDataset):
+    """Concatenate native72 datasets that share one normalization contract."""
+
+    def __init__(self, datasets: Sequence[Dataset], source_ids: Sequence[str]) -> None:
+        if not datasets:
+            raise ValueError("Native72MixtureDataset requires at least one dataset")
+        if len(datasets) != len(source_ids):
+            raise ValueError(
+                f"source_ids count {len(source_ids)} must match dataset count {len(datasets)}"
+            )
+        self.source_ids = [str(source_id) for source_id in source_ids]
+        if any(not source_id for source_id in self.source_ids):
+            raise ValueError("mixture source_ids must be non-empty")
+        super().__init__(list(datasets))
+        primary = self.datasets[0]
+        for name in ("state_mean", "state_std", "action_mean", "action_std"):
+            expected = np.asarray(getattr(primary, name), dtype=np.float32)
+            if any(
+                not np.array_equal(expected, np.asarray(getattr(child, name), dtype=np.float32))
+                for child in self.datasets[1:]
+            ):
+                raise ValueError(f"all mixture sources must share the same {name}")
+            setattr(self, name, expected)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(f"mixture dataset index {index} out of range")
+        dataset_index = bisect_right(self.cumulative_sizes, index)
+        previous_size = 0 if dataset_index == 0 else self.cumulative_sizes[dataset_index - 1]
+        local_index = index - previous_size
+        sample = self.datasets[dataset_index][local_index]
+        if not isinstance(sample, Mapping):
+            raise TypeError(
+                f"native72 child dataset {dataset_index} returned {type(sample)}, expected a mapping"
+            )
+        result = dict(sample)
+        result["_mixture_dataset_index"] = dataset_index
+        result["_mixture_local_index"] = local_index
+        result["_mixture_source_id"] = self.source_ids[dataset_index]
+        return result
+
+
+class DeterministicMixtureSampler(Sampler[int]):
+    """Deterministic replacement sampler with two-level mixture weighting.
+
+    Dataset weights choose the source.  A source's local sample weights are
+    normalized *inside that source*, preventing a large dataset or large raw
+    weight scale from silently changing the requested source proportions.
+    """
+
+    def __init__(
+        self,
+        dataset: Native72MixtureDataset,
+        dataset_weights: Sequence[float],
+        epoch_samples: int,
+        seed: int,
+    ) -> None:
+        if not isinstance(dataset, Native72MixtureDataset):
+            raise TypeError("DeterministicMixtureSampler requires Native72MixtureDataset")
+        if len(dataset_weights) != len(dataset.datasets):
+            raise ValueError(
+                f"dataset_weights count {len(dataset_weights)} must match "
+                f"dataset count {len(dataset.datasets)}"
+            )
+        source_weights = torch.as_tensor(dataset_weights, dtype=torch.float64)
+        if source_weights.numel() == 0 or not torch.isfinite(source_weights).all():
+            raise ValueError("mixture dataset weights must be finite and non-empty")
+        if torch.any(source_weights <= 0):
+            raise ValueError("mixture dataset weights must be strictly positive")
+        self.epoch_samples = int(epoch_samples)
+        if self.epoch_samples <= 0:
+            raise ValueError(f"epoch_samples must be positive, got {epoch_samples}")
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.epoch = 0
+        self._resume_position = 0
+
+        source_weights = source_weights / source_weights.sum()
+        probability_parts: list[torch.Tensor] = []
+        for dataset_index, (child, source_weight) in enumerate(
+            zip(dataset.datasets, source_weights)
+        ):
+            if len(child) <= 0:
+                raise ValueError(f"mixture child dataset {dataset_index} is empty")
+            sample_weights_fn = getattr(child, "sample_weights", None)
+            if callable(sample_weights_fn):
+                local_weights = torch.as_tensor(sample_weights_fn(), dtype=torch.float64)
+                if local_weights.ndim != 1 or local_weights.numel() != len(child):
+                    raise ValueError(
+                        f"child dataset {dataset_index} sample_weights shape "
+                        f"{tuple(local_weights.shape)} does not match length {len(child)}"
+                    )
+            else:
+                local_weights = torch.ones(len(child), dtype=torch.float64)
+            if not torch.isfinite(local_weights).all() or torch.any(local_weights < 0):
+                raise ValueError(
+                    f"child dataset {dataset_index} sample_weights must be finite and non-negative"
+                )
+            local_sum = local_weights.sum()
+            if float(local_sum) <= 0:
+                raise ValueError(f"child dataset {dataset_index} sample_weights sum must be positive")
+            probability_parts.append(source_weight * local_weights / local_sum)
+        self.probabilities = torch.cat(probability_parts)
+
+    def set_epoch(self, epoch: int) -> None:
+        epoch = int(epoch)
+        if epoch != self.epoch:
+            self._resume_position = 0
+        self.epoch = epoch
+
+    def set_resume_position(self, position: int) -> None:
+        position = int(position)
+        if position < 0 or position > self.epoch_samples:
+            raise ValueError(
+                f"resume position must be in [0, {self.epoch_samples}], got {position}"
+            )
+        self._resume_position = position
+
+    def __iter__(self) -> Iterator[int]:
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        indices = torch.multinomial(
+            self.probabilities,
+            self.epoch_samples,
+            replacement=True,
+            generator=generator,
+        )
+        return iter(indices[self._resume_position :].tolist())
+
+    def __len__(self) -> int:
+        return self.epoch_samples - self._resume_position
+
+
 class LeRobotNative72Dataset(Dataset):
     """Map LeRobotDataset rows into native RhinoVLA 72D training samples."""
 
@@ -581,6 +909,7 @@ class LeRobotNative72Dataset(Dataset):
         image_aug_profile: str = "none",
         image_aug_size: int = 256,
         image_augmentation: Optional[Dict[str, Any]] = None,
+        top_head_crop_size: Optional[Sequence[int]] = None,
         video_backend: str = "pyav",
         fixed_instruction: Optional[str] = None,
         sample_weight_override_path: Optional[str] = None,
@@ -609,6 +938,20 @@ class LeRobotNative72Dataset(Dataset):
             self.camera_order = [view.role for view in self.native_mapping.views]
             self.camera_source_keys = [view.key for view in self.native_mapping.views]
         self._camera_alias_by_source = dict(zip(self.camera_source_keys, self.camera_order))
+        if top_head_crop_size is None:
+            self.top_head_crop_size: tuple[int, int] | None = None
+        else:
+            crop_size = list(top_head_crop_size)
+            if len(crop_size) != 2:
+                raise ValueError(
+                    f"top_head_crop_size must be [positive_width, positive_height], got {crop_size}"
+                )
+            crop_width, crop_height = (int(value) for value in crop_size)
+            if crop_width <= 0 or crop_height <= 0:
+                raise ValueError(
+                    f"top_head_crop_size must be [positive_width, positive_height], got {crop_size}"
+                )
+            self.top_head_crop_size = (crop_width, crop_height)
         cd_cfg = camera_dropout or {}
         self.camera_dropout_enabled = bool(cd_cfg.get("enabled", False))
         self.camera_dropout_p = float(cd_cfg.get("p", 0.0))
@@ -751,6 +1094,10 @@ class LeRobotNative72Dataset(Dataset):
         # rows still carry episode_index=2, so `__getitem__` raises
         # IndexError. We load the whole dataset and filter at this layer by
         # intersecting `valid_chunk_start==1` with the requested episode ids.
+        if video_backend == "pyav":
+            _install_lerobot_pyav_seek_workaround()
+        elif video_backend == "torchcodec":
+            _install_lerobot_torchcodec_exact_decoder()
         LeRobotDataset = _lazy_lerobot_dataset_cls()
         delta_timestamps = {
             self.action_source_key: [k / float(self.native_mapping.fps) for k in range(self.action_horizon)]
@@ -778,10 +1125,7 @@ class LeRobotNative72Dataset(Dataset):
                     for task, ti in zip(tasks_pq.index, tasks_pq["task_index"])
                 }
 
-        # Drop video features not declared in mapping camera_mapping (e.g.,
-        # v3 dataset's head_right_rgb when training only uses 3 cams). Skips
-        # per-batch decode of unused cameras. ~24% speedup on Galbot v3
-        # (4 → 3 video keys), verified 2026-04-29 by lead.
+        # Avoid decoding video features not declared in camera_mapping.
         try:
             mapping_video_keys = set(self.camera_source_keys)
             current_video_keys = list(self.lerobot.meta.video_keys)
@@ -842,8 +1186,7 @@ class LeRobotNative72Dataset(Dataset):
                 f"no valid chunk starts under filter={self.valid_chunk_filter} "
                 f"(episodes_filter={self.episodes_filter}) in {self.mapping['root']}"
             )
-        # Sanity log so a future operator never wonders which filtering mode
-        # was actually applied (Codex review 2026-04-19 sanity).
+        # Log the filtering mode applied to this dataset.
         ep_summary = (
             f"all {len(set(ep_arr.tolist()))}"
             if self.episodes_filter is None else f"{len(self.episodes_filter)}"
@@ -1169,15 +1512,9 @@ class LeRobotNative72Dataset(Dataset):
     def decode_frame(self, global_row_idx: int) -> List[Image.Image]:
         """Decode the three canonical camera frames at an absolute parquet row.
 
-        Codex review blockers addressed:
-          - use the per-row `timestamp` column (episode-local, set by
-            LeRobotDataset at save time), NOT `global_row_idx / fps`, which
-            would cross episode boundaries and seek past EOF for any episode
-            after the first.
-          - avoid `self.lerobot._query_videos()`: LeRobot documents that
-            calling it from the main process while dataloader workers hold
-            video loaders can segfault. Use the stateless
-            `decode_video_frames(...)` helper directly.
+        Use the episode-local `timestamp` column instead of deriving time from
+        the global row index. Decode through the stateless helper because the
+        dataset's stateful video query is unsafe alongside dataloader workers.
         """
         row = self.lerobot.hf_dataset[global_row_idx]
         ts_val = row["timestamp"]
@@ -1211,8 +1548,7 @@ class LeRobotNative72Dataset(Dataset):
             return st_id, st, prompt
         task_index = int(_scalar_py(row.get("task_index", 0)) or 0)
         task = self._task_str_by_index.get(task_index, "")
-        # Match the old AgiBot adapter: +1 avoids the trainer's
-        # subtask_id==0 unknown sentinel.
+        # Reserve subtask_id=0 for the trainer's unknown sentinel.
         return task_index + 1, task, task
 
     def get_row_payload(self, global_row_idx: int) -> Dict[str, Any]:
@@ -1275,9 +1611,8 @@ class LeRobotNative72Dataset(Dataset):
         """Yield per-row metadata for every row in the underlying hf_dataset
         that belongs to this split (respects `episodes_filter`).
 
-        Codex review fix: without the filter, sample-viz / TF-error selection
-        could mine rows from the val split for the train dataset (or vice
-        versa), breaking apples-to-apples comparison with the JSONL pipeline.
+        Filtering prevents visualization and TF-error selection from crossing
+        between train and validation splits.
 
         Heavier than reading raw columns directly but returns a uniform
         structure callers can reason about. No vector columns (state / action)
@@ -1401,6 +1736,21 @@ class LeRobotNative72Dataset(Dataset):
             image = image.rotate(angle, resample=Image.Resampling.BILINEAR, fillcolor=(0, 0, 0))
         return image
 
+    def _apply_top_head_crop(self, image: Image.Image, role: Optional[str]) -> Image.Image:
+        """Apply the configured deterministic center crop to the top-head view."""
+        crop_size = self.top_head_crop_size
+        if crop_size is None or str(role or "") != "top_head":
+            return image
+        image_width, image_height = image.size
+        crop_width, crop_height = crop_size
+        if crop_width > image_width or crop_height > image_height:
+            raise ValueError(
+                f"top_head crop exceeds resized image: image={image.size}, crop={crop_size}"
+            )
+        left = (image_width - crop_width) // 2
+        top = (image_height - crop_height) // 2
+        return image.crop((left, top, left + crop_width, top + crop_height))
+
     @staticmethod
     def _mean_image(img: Image.Image) -> Image.Image:
         arr = np.asarray(img.convert("RGB"), dtype=np.float32)
@@ -1474,11 +1824,17 @@ class LeRobotNative72Dataset(Dataset):
         action_mask = np.broadcast_to(mask_from_spec(self.action_spec), normalized_action.shape).copy()
         state_mask = np.broadcast_to(mask_from_spec(self.state_spec), normalized_state[None, :].shape).copy()
 
-        pil_images = [self._select_image(sample[k]) for k in self.camera_source_keys]
+        roles = getattr(self, "view_roles", None) or self.camera_order
+        pil_images = [
+            self._apply_top_head_crop(
+                self._select_image(sample[key]),
+                roles[index] if index < len(roles) else None,
+            )
+            for index, key in enumerate(self.camera_source_keys)
+        ]
         if self._image_aug is not None:
             pil_images = [self._image_aug(img) for img in pil_images]
         if self._role_aug_target_role is not None:
-            roles = getattr(self, "view_roles", None) or self.camera_order
             pil_images = [
                 self._apply_role_image_aug(img, roles[i] if i < len(roles) else None)
                 for i, img in enumerate(pil_images)
@@ -1613,11 +1969,278 @@ def _resolve_episode_filter(vla_cfg, split: str) -> Optional[list[int]]:
     return None
 
 
-def build_dataloader(cfg, dataset_py: str = "lerobot_native72", split: str = "train", **_kwargs) -> DataLoader | None:
+def validate_native72_mixture_config(
+    vla_cfg: Any,
+    *,
+    split: str,
+    global_batch_size: int,
+) -> list[dict[str, Any]]:
+    """Validate a native72 mixture before constructing any video datasets."""
+    mixture_cfg = vla_cfg.get("mixture", None)
+    if not mixture_cfg:
+        raise ValueError("vla_data.mixture is required for native72 mixture validation")
+    entries_cfg = mixture_cfg.get("datasets", None)
+    if not entries_cfg:
+        raise ValueError("vla_data.mixture.datasets must contain at least one dataset")
+
+    required_fields = {
+        "id",
+        "weight",
+        "mapping_path",
+        "mapping_dataset_id",
+        "action_type",
+    }
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    first_entry = entries_cfg[0]
+    norm_value = vla_cfg.get("norm_stats_path", None) or first_entry.get("norm_stats_path", None)
+    norm_path = Path(str(norm_value or ""))
+    if not norm_path.is_file():
+        raise FileNotFoundError(
+            f"vla_data.norm_stats_path must name the shared mixture norm file: {norm_path}"
+        )
+    with norm_path.open("r", encoding="utf-8") as handle:
+        norm = json.load(handle)
+    for entry_index, entry_cfg in enumerate(entries_cfg):
+        if OmegaConf.is_config(entry_cfg):
+            entry = OmegaConf.to_container(entry_cfg, resolve=True)
+        else:
+            entry = dict(entry_cfg)
+        if not isinstance(entry, dict):
+            raise ValueError(f"mixture dataset entry {entry_index} must be a mapping")
+        missing = sorted(required_fields - set(entry))
+        if missing:
+            raise KeyError(
+                f"mixture dataset entry {entry_index} missing required field(s): {', '.join(missing)}"
+            )
+
+        dataset_id = str(entry["id"])
+        if not dataset_id:
+            raise ValueError(f"mixture dataset entry {entry_index} id must be non-empty")
+        if dataset_id in seen_ids:
+            raise ValueError(f"mixture dataset ids must be unique; duplicate {dataset_id!r}")
+        seen_ids.add(dataset_id)
+
+        weight = float(entry["weight"])
+        if not np.isfinite(weight) or weight <= 0:
+            raise ValueError(
+                f"mixture dataset {dataset_id!r} weight must be finite and strictly positive"
+            )
+        entry["weight"] = weight
+        entry["action_type"] = _normalize_action_type(entry["action_type"])
+
+        mapping_path = Path(str(entry["mapping_path"]))
+        source_norm = entry.get("norm_stats_path", norm_path)
+        if Path(str(source_norm)).resolve() != norm_path.resolve():
+            raise ValueError(
+                f"mixture source {dataset_id!r} must use shared norm {norm_path}, got {source_norm}"
+            )
+        entry["norm_stats_path"] = str(norm_path)
+        if not mapping_path.is_file():
+            raise FileNotFoundError(
+                f"mixture dataset {dataset_id!r} mapping_path does not exist: {mapping_path}"
+            )
+
+        mapping_dataset_id = str(entry["mapping_dataset_id"])
+        try:
+            mapping = load_lerobot_mapping(mapping_path, dataset_id=mapping_dataset_id)
+        except KeyError as exc:
+            raise KeyError(
+                f"mixture dataset {dataset_id!r} mapping_dataset_id "
+                f"{mapping_dataset_id!r} was not found in {mapping_path}"
+            ) from exc
+        if mapping.dataset_id != dataset_id or mapping_dataset_id != dataset_id:
+            raise ValueError(
+                f"mixture id/mapping_dataset_id must match selected mapping dataset id: "
+                f"id={dataset_id!r}, mapping_dataset_id={mapping_dataset_id!r}, "
+                f"selected={mapping.dataset_id!r}"
+            )
+        dataset_root = Path(mapping.root)
+        if not dataset_root.exists():
+            raise FileNotFoundError(
+                f"mixture dataset {dataset_id!r} root does not exist: {dataset_root}"
+            )
+        active_action_slots = {int(slot) for slot in mapping.action.active_slots}
+        absolute_action_slots = sorted(
+            int(slot)
+            for slot in mapping.raw.get("absolute_action_slots", [])
+            if int(slot) in active_action_slots
+        )
+        delta_slots = _resolve_action_delta_slots(
+            action_type=entry["action_type"],
+            active_state_slots=mapping.state.active_slots,
+            active_action_slots=mapping.action.active_slots,
+            absolute_action_slots=absolute_action_slots,
+        )
+        selected_norm = _select_action_norm_stats(
+            norm,
+            action_type=entry["action_type"],
+            delta_slots=delta_slots,
+            absolute_action_slots=absolute_action_slots,
+        )
+        for stat_name, values in selected_norm.items():
+            array = np.asarray(values, dtype=np.float64)
+            if array.ndim != 1 or not np.isfinite(array).all():
+                raise ValueError(
+                    f"mixture dataset {dataset_id!r} norm {stat_name} must be a finite 1D array"
+                )
+            if stat_name.endswith("_std") and np.any(array <= 0):
+                raise ValueError(
+                    f"mixture dataset {dataset_id!r} norm {stat_name} must be strictly positive"
+                )
+        entries.append(entry)
+
+    if split == "train":
+        epoch_samples = int(mixture_cfg.get("epoch_samples", 0))
+        batch_size = int(global_batch_size)
+        if epoch_samples <= 0:
+            raise ValueError(f"mixture epoch_samples must be positive, got {epoch_samples}")
+        if batch_size <= 0:
+            raise ValueError(f"global_batch_size must be positive, got {global_batch_size}")
+        if epoch_samples % batch_size != 0:
+            raise ValueError(
+                f"mixture epoch_samples={epoch_samples} must be divisible by "
+                f"global_batch_size={batch_size}"
+            )
+    return entries
+
+
+def _build_mixture_dataloader(cfg: Any, vla_cfg: Any, split: str, **kwargs: Any) -> DataLoader | None:
+    qwen_processor = kwargs.get("qwen_processor")
+    per_device_batch_size = int(vla_cfg.get("per_device_batch_size", 1))
+    if per_device_batch_size <= 0:
+        raise ValueError(f"per_device_batch_size must be positive, got {per_device_batch_size}")
+    world_size = int(kwargs.get("num_processes", os.environ.get("WORLD_SIZE", 1)))
+    global_batch_size = int(
+        kwargs.get("global_batch_size", per_device_batch_size * world_size)
+    )
+    entries = validate_native72_mixture_config(
+        vla_cfg,
+        split=split,
+        global_batch_size=global_batch_size,
+    )
+
+    if OmegaConf.is_config(vla_cfg):
+        base_cfg = OmegaConf.to_container(vla_cfg, resolve=True)
+    else:
+        base_cfg = dict(vla_cfg)
+    if not isinstance(base_cfg, dict):
+        raise ValueError("vla_data config must be a mapping")
+    base_cfg.pop("mixture", None)
+
+    datasets: list[LeRobotNative72Dataset] = []
+    source_ids: list[str] = []
+    dataset_weights: list[float] = []
+    for entry in entries:
+        entry_cfg = OmegaConf.merge(OmegaConf.create(base_cfg), OmegaConf.create(entry))
+        stats_override = _resolve_lerobot_stats(entry_cfg, split=split)
+        episodes_filter = _resolve_episode_filter(entry_cfg, split=split)
+        if split == "val" and not episodes_filter:
+            continue
+
+        image_size = entry_cfg.get("image_size", [256, 256])
+        image_size = list(image_size) if hasattr(image_size, "__iter__") else [int(image_size)]
+        aug_profile = str(entry_cfg.get("image_aug_profile", "none")) if split == "train" else "none"
+        dataset = LeRobotNative72Dataset(
+            mapping_path=entry_cfg.mapping_path,
+            action_horizon=int(entry_cfg.get("action_horizon", 30)),
+            stats_override=stats_override,
+            episodes=episodes_filter,
+            image_aug_profile=aug_profile,
+            image_aug_size=int(image_size[0]),
+            image_augmentation=dict(entry_cfg.get("image_augmentation", {})) if split == "train" else None,
+            top_head_crop_size=entry_cfg.get("top_head_crop_size", None),
+            video_backend=str(entry_cfg.get("video_backend", "pyav")),
+            fixed_instruction=entry_cfg.get("fixed_instruction", None),
+            sample_weight_override_path=(
+                entry_cfg.get("sample_weight_override_path", None) if split == "train" else None
+            ),
+            sample_weight_override_column=str(
+                entry_cfg.get("sample_weight_override_column", "sample_weight")
+            ),
+            camera_dropout=entry_cfg.get("camera_dropout", None) if split == "train" else None,
+            sample_weight_override_mode=str(
+                entry_cfg.get("sample_weight_override_mode", "replace")
+            ),
+            mapping_dataset_id=entry_cfg.mapping_dataset_id,
+            action_type=str(entry_cfg.action_type),
+        )
+        view_roles = entry_cfg.get("view_roles", None)
+        view_modalities = entry_cfg.get("view_modalities", None)
+        dataset.view_roles = [str(value) for value in view_roles] if view_roles else None
+        dataset.view_modalities = [str(value) for value in view_modalities] if view_modalities else None
+        datasets.append(dataset)
+        source_ids.append(str(entry["id"]))
+        dataset_weights.append(float(entry["weight"]))
+
+    if not datasets:
+        return None
+    dataset = Native72MixtureDataset(datasets=datasets, source_ids=source_ids)
+
+    if split == "train":
+        primary = datasets[0]
+        vla_cfg.state_mean = primary.state_mean.tolist()
+        vla_cfg.state_std = primary.state_std.tolist()
+        vla_cfg.action_mean = primary.action_mean.tolist()
+        vla_cfg.action_std = primary.action_std.tolist()
+        vla_cfg.action_type = primary.action_type
+        vla_cfg.action_delta_from_state_dims = list(primary.delta_action_slots)
+        vla_cfg.absolute_action_slots = list(primary.absolute_action_slots)
+
+    sampler = None
+    shuffle = split == "val"
+    if split == "train":
+        mixture_cfg = vla_cfg.mixture
+        sampler = DeterministicMixtureSampler(
+            dataset=dataset,
+            dataset_weights=dataset_weights,
+            epoch_samples=int(mixture_cfg.epoch_samples),
+            seed=int(mixture_cfg.get("seed", 0)),
+        )
+        shuffle = False
+
+    num_workers = int(vla_cfg.get("num_workers", 1))
+    preprocess_qwen = bool(vla_cfg.get("preprocess_qwen_in_dataloader", False))
+    if preprocess_qwen and qwen_processor is not None:
+        collate_fn = build_qwen_cpu_preprocess_collator(vla_cfg, processor=qwen_processor)
+    elif preprocess_qwen and split == "train":
+        raise ValueError("preprocess_qwen_in_dataloader=true requires the training Qwen processor")
+    else:
+        collate_fn = lambda batch: batch
+    dl_kwargs = {
+        "batch_size": per_device_batch_size,
+        "shuffle": shuffle,
+        "sampler": sampler,
+        "num_workers": num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": bool(vla_cfg.get("pin_memory", True)),
+    }
+    if num_workers > 0:
+        dl_kwargs["persistent_workers"] = bool(vla_cfg.get("persistent_workers", True))
+        dl_kwargs["prefetch_factor"] = int(vla_cfg.get("prefetch_factor", 4))
+    return DataLoader(dataset, **dl_kwargs)
+
+
+def build_dataloader(
+    cfg,
+    dataset_py: str = "lerobot_native72",
+    split: str = "train",
+    *,
+    qwen_processor: Any | None = None,
+    **_kwargs,
+) -> DataLoader | None:
     if dataset_py != "lerobot_native72":
         raise ValueError(f"Unsupported dataset_py: {dataset_py}")
 
     vla_cfg = cfg.datasets.vla_data
+    if vla_cfg.get("mixture", None):
+        return _build_mixture_dataloader(
+            cfg,
+            vla_cfg,
+            split,
+            qwen_processor=qwen_processor,
+            **_kwargs,
+        )
     mapping_path = vla_cfg.get("mapping_path", None)
     if not mapping_path:
         raise ValueError("vla_data.mapping_path is required for dataset_py=lerobot_native72")
@@ -1649,6 +2272,7 @@ def build_dataloader(cfg, dataset_py: str = "lerobot_native72", split: str = "tr
         image_aug_profile=aug_profile,
         image_aug_size=int(image_size[0]),
         image_augmentation=dict(vla_cfg.get("image_augmentation", {})) if split == "train" else None,
+        top_head_crop_size=vla_cfg.get("top_head_crop_size", None),
         video_backend=str(vla_cfg.get("video_backend", "pyav")),
         fixed_instruction=vla_cfg.get("fixed_instruction", None),
         sample_weight_override_path=vla_cfg.get("sample_weight_override_path", None) if split == "train" else None,
@@ -1700,12 +2324,20 @@ def build_dataloader(cfg, dataset_py: str = "lerobot_native72", split: str = "tr
     # `pin_memory=True` moves tensors to pinned host memory for faster
     # H2D copies on the training side.
     num_workers = int(vla_cfg.get("num_workers", 1))
+    preprocess_qwen = bool(vla_cfg.get("preprocess_qwen_in_dataloader", False))
+    if preprocess_qwen and qwen_processor is not None:
+        collate_fn = build_qwen_cpu_preprocess_collator(vla_cfg, processor=qwen_processor)
+    elif preprocess_qwen and split == "train":
+        raise ValueError("preprocess_qwen_in_dataloader=true requires the training Qwen processor")
+    else:
+        collate_fn = lambda batch: batch
+
     dl_kwargs = {
         "batch_size": int(vla_cfg.get("per_device_batch_size", 1)),
         "shuffle": shuffle,
         "sampler": sampler,
         "num_workers": num_workers,
-        "collate_fn": lambda batch: batch,
+        "collate_fn": collate_fn,
         "pin_memory": bool(vla_cfg.get("pin_memory", True)),
     }
     if num_workers > 0:
