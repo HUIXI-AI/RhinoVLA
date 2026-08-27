@@ -12,6 +12,7 @@ import os
 import textwrap
 import io
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -34,6 +35,8 @@ logger = get_logger(__name__)
 _RESAMPLE_BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
 _RESAMPLE_BICUBIC = getattr(Image, "Resampling", Image).BICUBIC
 _PARENTHETICAL_TITLE_RE = re.compile(r"\s*\([^)]*\)")
+ATTENTION_HEATMAP_ALPHA_MAX = 0.48
+ATTENTION_HEATMAP_LIGHTEN = 0.16
 
 
 def _cfg_get(container: Any, key: str) -> Any:
@@ -415,6 +418,71 @@ def _denormalize_tf_error_actions(
     return (values_np * std_np + mean_np).astype(np.float32)
 
 
+_VIZ_NORM_KEYS = ("state_mean", "state_std", "action_mean", "action_std")
+
+
+def _mixture_child_index_for_viz_sample(
+    dataset: Any,
+    sample: Mapping[str, Any],
+) -> int | None:
+    """Resolve the child that owns a mixture sample's raw episode rows."""
+    children = getattr(dataset, "datasets", None)
+    if children is None:
+        return None
+    raw_index = sample.get("_mixture_dataset_index")
+    if raw_index is None:
+        raise ValueError("mixture visualization sample is missing dataset child index")
+    if isinstance(raw_index, bool):
+        raise ValueError(f"invalid mixture dataset child index {raw_index!r}")
+    if isinstance(raw_index, (int, np.integer)):
+        child_index = int(raw_index)
+    else:
+        raise ValueError(f"invalid mixture dataset child index {raw_index!r}")
+
+    if child_index < 0 or child_index >= len(children):
+        raise ValueError(f"mixture dataset child index {child_index} is out of range")
+    return child_index
+
+
+def _viz_dataset_for_sample(dataset: Any, sample: Mapping[str, Any]) -> Any:
+    """Route a mixture sample to the child owning its raw episode rows."""
+
+    child_index = _mixture_child_index_for_viz_sample(dataset, sample)
+    return dataset if child_index is None else dataset.datasets[child_index]
+
+
+def _norm_stats_for_viz_sample(dataset: Any) -> dict[str, np.ndarray]:
+    """Resolve the global norm shared by all visualization samples."""
+    resolved: dict[str, np.ndarray] = {}
+    for name in _VIZ_NORM_KEYS:
+        value = getattr(dataset, name, None)
+        if value is None:
+            raise ValueError(f"visualization norm is missing {name}")
+        array = np.asarray(value, dtype=np.float32).reshape(-1)
+        if array.size == 0 or not np.all(np.isfinite(array)):
+            raise ValueError(f"visualization norm {name} must be finite and non-empty")
+        resolved[name] = array
+
+    if resolved["state_mean"].shape != resolved["state_std"].shape:
+        raise ValueError("visualization state norm mean/std shapes do not match")
+    if resolved["action_mean"].shape != resolved["action_std"].shape:
+        raise ValueError("visualization action norm mean/std shapes do not match")
+    if np.any(resolved["state_std"] <= 0) or np.any(resolved["action_std"] <= 0):
+        raise ValueError("visualization norm std values must be positive")
+    return resolved
+
+
+def _delta_action_slots_for_viz_sample(dataset: Any, sample: Mapping[str, Any]) -> list[int]:
+    """Return action semantics from the mixture child that produced a sample."""
+
+    child = _viz_dataset_for_sample(dataset, sample)
+    if child is dataset:
+        return [int(slot) for slot in getattr(dataset, "delta_action_slots", [])]
+    if not hasattr(child, "delta_action_slots"):
+        raise ValueError("mixture visualization child is missing delta_action_slots")
+    return [int(slot) for slot in child.delta_action_slots]
+
+
 def _tf_error_actions_to_absolute_units(
     *,
     gt_action: np.ndarray,
@@ -520,20 +588,11 @@ def _draw_token_grid(
     out = np.asarray(rgb).copy()
     height, width = out.shape[:2]
     xs, ys = grid_lines
-    cv2 = _cv2_module()
-    if cv2 is not None:
-        for x in xs:
-            cv2.line(out, (int(x), 0), (int(x), max(0, height - 1)), (255, 255, 255), 1, cv2.LINE_AA)
-        for y in ys:
-            cv2.line(out, (0, int(y)), (max(0, width - 1), int(y)), (255, 255, 255), 1, cv2.LINE_AA)
-        return out
-    pil = Image.fromarray(out)
-    draw = ImageDraw.Draw(pil)
-    for x in xs:
-        draw.line((int(x), 0, int(x), max(0, height - 1)), fill=(255, 255, 255), width=1)
-    for y in ys:
-        draw.line((0, int(y), max(0, width - 1), int(y)), fill=(255, 255, 255), width=1)
-    return np.asarray(pil)
+    mask = np.zeros((height, width), dtype=bool)
+    mask[:, [max(0, min(width - 1, int(x))) for x in xs]] = True
+    mask[[max(0, min(height - 1, int(y))) for y in ys], :] = True
+    out[mask] = (0.78 * out[mask].astype(np.float32) + 0.22 * 255.0).clip(0, 255).astype(np.uint8)
+    return out
 
 
 def _overlay_reference_cell(
@@ -556,8 +615,14 @@ def _overlay_reference_cell(
             heat = cv2.applyColorMap((up * 255).clip(0, 255).astype(np.uint8), cv2.COLORMAP_JET)
             heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
         else:
-            heat = np.asarray(_heatmap_to_rgb(arr).resize((width, height), _RESAMPLE_BICUBIC))
-        overlay = (0.55 * rgb + 0.45 * heat).clip(0, 255).astype(np.uint8)
+            up = np.asarray(Image.fromarray(arr).resize((width, height), _RESAMPLE_BICUBIC)).clip(0.0, 1.0)
+            heat = np.asarray(_heatmap_to_rgb(up))
+        heat = (
+            (1.0 - ATTENTION_HEATMAP_LIGHTEN) * heat.astype(np.float32)
+            + ATTENTION_HEATMAP_LIGHTEN * 255.0
+        ).clip(0, 255)
+        alpha = (ATTENTION_HEATMAP_ALPHA_MAX * np.sqrt(up.clip(0.0, 1.0)))[..., None]
+        overlay = ((1.0 - alpha) * rgb.astype(np.float32) + alpha * heat).clip(0, 255).astype(np.uint8)
     overlay = _draw_token_grid(overlay, token_grid_lines)
     header_h = 36
     canvas = Image.new("RGB", (width, height + header_h), (0, 0, 0))
@@ -775,54 +840,6 @@ def build_action_expert_attention_panel(
     return canvas
 
 
-def build_tf_error_panel(
-    *,
-    pred: np.ndarray,
-    gt: np.ndarray,
-    mask: np.ndarray | None = None,
-    step: int = 0,
-    title: str = "TF-error chunk",
-    max_dims: int | None = None,
-    units_label: str = "absolute action units",
-) -> Image.Image:
-    """Fallback TF-error plot using the same style as the episode plot."""
-
-    pred_np = np.asarray(pred, dtype=np.float32)
-    gt_np = np.asarray(gt, dtype=np.float32)
-    if pred_np.ndim != 2 or gt_np.ndim != 2:
-        raise ValueError(f"pred and gt must be 2D, got {pred_np.shape} and {gt_np.shape}")
-    horizon = min(pred_np.shape[0], gt_np.shape[0])
-    dims = min(pred_np.shape[1], gt_np.shape[1])
-    pred_np = pred_np[:horizon, :dims]
-    gt_np = gt_np[:horizon, :dims]
-    if mask is None:
-        mask_np = np.ones_like(gt_np, dtype=np.float32)
-    else:
-        mask_np = np.asarray(mask, dtype=np.float32)
-        if mask_np.ndim == 1:
-            mask_np = np.broadcast_to(mask_np[None, :], gt_np.shape)
-        mask_np = mask_np[:horizon, :dims]
-    active, labels = _tf_error_active_slots_and_labels(mask_np[0], action_dim=dims)
-    if max_dims is not None:
-        active = active[: int(max_dims)]
-        labels = labels[: int(max_dims)]
-    gt_view = gt_np[:, active]
-    pred_view = pred_np[:, active]
-    return build_tf_error_episode_panel(
-        frame_ids=np.arange(horizon, dtype=np.int64),
-        gt_action=gt_view,
-        pred_segments=[(0, pred_view)],
-        bounds=[],
-        dataset_index=None,
-        episode_index=None,
-        episode_id=f"single-chunk step={step}",
-        chunk_len=horizon,
-        dim_labels=labels,
-        title_prefix=title,
-        units_label=units_label,
-    )
-
-
 def _collect_subtask_bounds(payloads: list[dict[str, Any]]) -> list[tuple[int, int, str]]:
     if not payloads:
         return []
@@ -909,10 +926,6 @@ def _expand_terminal_display_indices(
         out.append(int(global_i))
         expected_frame = frame + 1
     return out
-
-
-def _tf_error_max_frames() -> int:
-    return int(os.environ.get("RHINOVLA_VIZ_TF_MAX_FRAMES", "1000"))
 
 
 def build_tf_error_episode_panel(
@@ -1042,12 +1055,19 @@ class _VizMixin:
     def _viz_sample_at(self, dataset, idx: int) -> dict[str, Any]:
         sample = dict(dataset[idx])
         sample["_dataset_sample_index"] = idx
-        valid = getattr(dataset, "valid_global_indices", None)
-        if valid is not None and idx < len(valid):
-            sample["_global_row_index"] = int(valid[idx])
+        source_dataset = _viz_dataset_for_sample(dataset, sample)
+        local_index = int(sample.get("_mixture_local_index", idx))
+        valid = getattr(source_dataset, "valid_global_indices", None)
+        if valid is not None and local_index < len(valid):
+            sample["_global_row_index"] = int(valid[local_index])
         return sample
 
-    def _viz_samples(self, count: int = 1, *, unique_episode: bool = False) -> list[dict[str, Any]]:
+    def _viz_samples(
+        self,
+        count: int = 1,
+        *,
+        unique_episode: bool = False,
+    ) -> list[dict[str, Any]]:
         dataset = getattr(self.vla_train_dataloader, "dataset", None)
         if dataset is None or len(dataset) == 0:
             return []
@@ -1058,22 +1078,32 @@ class _VizMixin:
         start_idx = max(0, min(start_idx, len(dataset) - 1))
         wanted = max(1, int(count))
         samples: list[dict[str, Any]] = []
-        seen_episodes: set[int] = set()
-        for offset in range(len(dataset)):
-            idx = (start_idx + offset) % len(dataset)
+        seen_episodes: set[tuple[int | None, int]] = set()
+        indices = (
+            np.random.default_rng(int(self.config.seed) + int(self.completed_steps)).permutation(len(dataset))
+            if unique_episode
+            else ((start_idx + offset) % len(dataset) for offset in range(len(dataset)))
+        )
+        for idx in indices:
+            idx = int(idx)
             sample = self._viz_sample_at(dataset, idx)
             if unique_episode:
                 global_row = sample.get("_global_row_index")
                 episode_index = None
-                if global_row is not None and hasattr(dataset, "get_row_payload"):
+                source_dataset = _viz_dataset_for_sample(dataset, sample)
+                if global_row is not None and hasattr(source_dataset, "get_row_payload"):
                     try:
-                        episode_index = int(dataset.get_row_payload(int(global_row)).get("episode_index", idx))
+                        episode_index = int(
+                            source_dataset.get_row_payload(int(global_row)).get("episode_index", idx)
+                        )
                     except Exception:  # noqa: BLE001
                         episode_index = idx
-                if episode_index in seen_episodes:
+                child_index = _mixture_child_index_for_viz_sample(dataset, sample)
+                episode_key = (child_index, episode_index)
+                if episode_key in seen_episodes:
                     continue
                 if episode_index is not None:
-                    seen_episodes.add(episode_index)
+                    seen_episodes.add(episode_key)
             samples.append(sample)
             if len(samples) >= wanted:
                 break
@@ -1139,13 +1169,37 @@ class _VizMixin:
     def _raw_images_for_sample(self, sample: dict[str, Any]) -> list[Image.Image] | None:
         dataset = getattr(self.vla_train_dataloader, "dataset", None)
         global_row = sample.get("_global_row_index")
-        if dataset is None or global_row is None or not hasattr(dataset, "decode_frame"):
+        if dataset is None or global_row is None:
+            return None
+        dataset = _viz_dataset_for_sample(dataset, sample)
+        if not hasattr(dataset, "decode_frame"):
             return None
         try:
             return [_image_from_any(img) for img in dataset.decode_frame(int(global_row))]
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"raw frame decode for attention skipped: {exc}")
             return None
+
+    def _viz_sample_identity(self, sample: dict[str, Any]) -> str:
+        dataset = getattr(self.vla_train_dataloader, "dataset", None)
+        source_id = str(sample.get("_mixture_source_id", "single"))
+        global_row = sample.get("_global_row_index")
+        episode = "?"
+        frame = "?"
+        if dataset is not None and global_row is not None:
+            source_dataset = _viz_dataset_for_sample(dataset, sample)
+            if hasattr(source_dataset, "get_row_payload"):
+                try:
+                    payload = source_dataset.get_row_payload(int(global_row))
+                    episode = str(payload.get("episode_index", "?"))
+                    frame = str(payload.get("frame_index", "?"))
+                except Exception:  # noqa: BLE001
+                    pass
+        prompt = str(sample.get("lang", "")).replace("\n", " ").strip()
+        return (
+            f"source={source_id}, episode={episode}, frame={frame}, "
+            f"row={global_row}, prompt={prompt}"
+        )
 
     def _log_swanlab_image(self, key: str, path: Path, *, step: int) -> None:
         if not (HAS_SWANLAB and self._swanlab_enabled):
@@ -1163,6 +1217,7 @@ class _VizMixin:
         global_row = sample.get("_global_row_index")
         if dataset is None or global_row is None:
             return None
+        dataset = _viz_dataset_for_sample(dataset, sample)
         if not all(hasattr(dataset, name) for name in ("get_row_payload", "decode_frame")):
             return None
 
@@ -1177,9 +1232,11 @@ class _VizMixin:
         valid_start_indices = sorted(set(valid_start_indices))
         if not valid_start_indices:
             return None
-        max_frames = _tf_error_max_frames()
         chunk_len = int(getattr(raw_model, "action_horizon", sample.get("action", np.zeros((30, 1))).shape[0]))
-        row_indices = _expand_terminal_display_indices(dataset, valid_start_indices, chunk_len, max_frames)
+        # A TF episode report is intentionally complete: never truncate its
+        # chronological frame range, even when the episode is longer than the
+        # historical visualization cap.
+        row_indices = _expand_terminal_display_indices(dataset, valid_start_indices, chunk_len, 0)
         if not row_indices:
             return None
 
@@ -1192,31 +1249,87 @@ class _VizMixin:
             first_mask = first_mask[0]
         active, dim_labels = _tf_error_active_slots_and_labels(first_mask, action_dim=action_raw.shape[-1])
 
-        state_mean = np.asarray(getattr(dataset, "state_mean"), dtype=np.float32)
-        state_std = np.asarray(getattr(dataset, "state_std"), dtype=np.float32)
-        action_mean = np.asarray(getattr(dataset, "action_mean"), dtype=np.float32)
-        action_std = np.asarray(getattr(dataset, "action_std"), dtype=np.float32)
+        norm_stats = _norm_stats_for_viz_sample(dataset)
+        state_mean = norm_stats["state_mean"]
+        state_std = norm_stats["state_std"]
+        action_mean = norm_stats["action_mean"]
+        action_std = norm_stats["action_std"]
         state_mask = np.asarray(sample.get("state_mask", np.ones((1, state_mean.shape[0]))), dtype=np.float32)
         action_mask = np.asarray(sample.get("action_mask", np.ones((chunk_len, action_mean.shape[0]))), dtype=np.float32)
         if action_mask.ndim == 1:
             action_mask = np.broadcast_to(action_mask[None, :], (chunk_len, action_mean.shape[0])).copy()
         pred_segments: list[tuple[int, np.ndarray]] = []
         fallback_prompt = str(sample.get("lang") or payload0.get("subtask_prompt") or "")
+        fixed_instruction = getattr(dataset, "fixed_instruction", None)
         camera_keys = list(getattr(dataset, "camera_source_keys", []))
-        chunk_positions = _chunk_start_positions(len(row_indices), chunk_len, max_chunks=0)
+        row_positions = {int(row): pos for pos, row in enumerate(row_indices)}
+        valid_chunk_positions = {
+            row_positions[int(row)]
+            for row in valid_start_indices
+            if int(row) in row_positions
+        }
+        chunk_positions = [
+            position
+            for position in _chunk_start_positions(len(row_indices), chunk_len)
+            if position in valid_chunk_positions
+        ]
+        config = getattr(self, "config", None)
+        datasets_cfg = getattr(config, "datasets", None)
+        vla_cfg = getattr(datasets_cfg, "vla_data", {})
+        batch_size = int(vla_cfg.get("per_device_batch_size", 1))
+        if batch_size <= 0:
+            raise ValueError(f"per_device_batch_size must be positive, got {batch_size}")
+        pending_examples: list[dict[str, Any]] = []
+        pending_positions: list[int] = []
+
+        def flush_pending() -> None:
+            if not pending_examples:
+                return
+            with torch.no_grad():
+                pred = raw_model.predict_action(pending_examples)
+            pred_np_batch = pred.detach().float().cpu().numpy()
+            for position, pred_np in zip(pending_positions, pred_np_batch):
+                pred_raw = _denormalize_tf_error_actions(
+                    pred_np,
+                    action_mean=action_mean,
+                    action_std=action_std,
+                )
+                pred_segments.append((int(position), pred_raw))
+            pending_examples.clear()
+            pending_positions.clear()
+
         for t0 in chunk_positions:
             row = int(row_indices[t0])
             payload = payloads[t0]
             raw_images = dataset.decode_frame(row)
-            if camera_keys and hasattr(dataset, "_select_image"):
-                model_images = [dataset._select_image(img) for img in raw_images]  # noqa: SLF001
-            else:
-                model_images = [_image_from_any(img) for img in raw_images]
+            roles = (
+                getattr(dataset, "view_roles", None)
+                or getattr(dataset, "camera_order", None)
+                or sample.get("view_roles")
+                or []
+            )
+            model_images = []
+            for image_index, image in enumerate(raw_images):
+                if camera_keys and hasattr(dataset, "_select_image"):
+                    model_image = dataset._select_image(image)  # noqa: SLF001
+                else:
+                    model_image = _image_from_any(image)
+                if hasattr(dataset, "_apply_top_head_crop"):
+                    role = roles[image_index] if image_index < len(roles) else None
+                    model_image = dataset._apply_top_head_crop(model_image, role)  # noqa: SLF001
+                model_images.append(model_image)
             state_raw = np.asarray(payload["state_raw"], dtype=np.float32)
             state_norm = (state_raw - state_mean) / state_std
             example = {
                 "image": model_images,
-                "lang": str(payload.get("subtask_prompt") or fallback_prompt),
+                # Fixed-instruction recipes must reuse the exact training
+                # prompt for every chunk; legacy segment-prompt recipes retain
+                # their per-row instruction semantics.
+                "lang": (
+                    fallback_prompt
+                    if fixed_instruction
+                    else str(payload.get("subtask_prompt") or fallback_prompt)
+                ),
                 "state": state_norm[None, :],
                 "state_mask": state_mask,
                 "action": np.zeros((chunk_len, action_mean.shape[0]), dtype=np.float32),
@@ -1224,15 +1337,11 @@ class _VizMixin:
                 "view_roles": sample.get("view_roles"),
                 "view_modalities": sample.get("view_modalities"),
             }
-            with torch.no_grad():
-                pred = raw_model.predict_action([example])
-            pred_np = pred.detach().float().cpu().numpy()[0]
-            pred_raw = _denormalize_tf_error_actions(
-                pred_np,
-                action_mean=action_mean,
-                action_std=action_std,
-            )
-            pred_segments.append((int(t0), pred_raw))
+            pending_examples.append(example)
+            pending_positions.append(int(t0))
+            if len(pending_examples) >= batch_size:
+                flush_pending()
+        flush_pending()
 
         if not pred_segments:
             return None
@@ -1240,7 +1349,7 @@ class _VizMixin:
             gt_action=action_raw,
             gt_reference_states=state_raw_rows,
             pred_segments=pred_segments,
-            delta_slots=getattr(dataset, "delta_action_slots", []),
+            delta_slots=_delta_action_slots_for_viz_sample(dataset, sample),
         )
         gt_action = gt_action_abs[:, active]
         pred_segments = [(t0, segment[:, active]) for t0, segment in pred_segments_abs]
@@ -1335,45 +1444,11 @@ class _VizMixin:
                     torch.manual_seed(0)
                     panel = self._episode_tf_error_panel(raw_model, sample)
                     if panel is None:
-                        with torch.no_grad():
-                            pred = raw_model.predict_action([sample])
-                        pred_np = pred.detach().float().cpu().numpy()[0]
-                        dataset = getattr(self.vla_train_dataloader, "dataset", None)
-                        action_mean = np.asarray(getattr(dataset, "action_mean"), dtype=np.float32)
-                        action_std = np.asarray(getattr(dataset, "action_std"), dtype=np.float32)
-                        pred_raw = _denormalize_tf_error_actions(
-                            pred_np,
-                            action_mean=action_mean,
-                            action_std=action_std,
+                        logger.warning(
+                            "TF-error visualization skipped for sample %s: complete episode unavailable",
+                            sample_idx,
                         )
-                        if sample.get("action_raw") is not None:
-                            gt_raw = np.asarray(sample["action_raw"], dtype=np.float32)
-                        else:
-                            gt_raw = _denormalize_tf_error_actions(
-                                np.asarray(sample["action"], dtype=np.float32),
-                                action_mean=action_mean,
-                                action_std=action_std,
-                            )
-                        gt_raw = gt_raw[-pred_np.shape[0] :, : pred_np.shape[1]]
-                        state_raw = np.asarray(sample["state_raw"], dtype=np.float32).reshape(-1, gt_raw.shape[1])[0]
-                        gt_reference_states = np.broadcast_to(state_raw[None, :], gt_raw.shape)
-                        gt, pred_abs_segments = _tf_error_actions_to_absolute_units(
-                            gt_action=gt_raw,
-                            gt_reference_states=gt_reference_states,
-                            pred_segments=[(0, pred_raw)],
-                            delta_slots=getattr(dataset, "delta_action_slots", []),
-                        )
-                        mask = np.asarray(sample.get("action_mask", np.ones_like(gt)), dtype=np.float32)
-                        if mask.ndim == 1:
-                            mask = np.broadcast_to(mask[None, :], gt.shape)
-                        panel = build_tf_error_panel(
-                            pred=pred_abs_segments[0][1],
-                            gt=gt,
-                            mask=mask,
-                            step=self.completed_steps,
-                            title="TF chunk inference",
-                            units_label="absolute action units",
-                        )
+                        continue
                     out_path = visual_dir / _indexed_viz_path(
                         "tf_error",
                         self.completed_steps,
@@ -1398,7 +1473,8 @@ class _VizMixin:
         if not self.accelerator.is_main_process:
             return
         samples = self._viz_samples(
-            self._viz_count("viz_attention_num_samples", "RHINOVLA_VIZ_ATTENTION_NUM_SAMPLES")
+            self._viz_count("viz_attention_num_samples", "RHINOVLA_VIZ_ATTENTION_NUM_SAMPLES"),
+            unique_episode=True,
         )
         if not samples:
             return
@@ -1450,7 +1526,10 @@ class _VizMixin:
                         step=self.completed_steps,
                         framework=raw_model.__class__.__name__,
                         ckpt_path=self._ckpt_path_for_viz(),
-                        subtitle=f"captured={len(captured)} tensors, image_grids={grid.tolist()}, merge={merge_size}",
+                        subtitle=(
+                            f"{self._viz_sample_identity(sample)} | captured={len(captured)} tensors, "
+                            f"image_grids={grid.tolist()}, merge={merge_size}"
+                        ),
                     )
                     out_path = visual_dir / _indexed_viz_path(
                         "attention",

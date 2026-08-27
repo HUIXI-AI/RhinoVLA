@@ -21,6 +21,32 @@ def _warn(message: str) -> None:
         print(f"WARNING: {message}")
 
 
+def _validated_action_stats(profile, *, context: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return one validated native72 action normalization profile."""
+    action_mean = np.asarray(profile.get("action_mean", None), dtype=np.float32)
+    action_std = np.asarray(profile.get("action_std", None), dtype=np.float32)
+    if action_mean.shape != (RHINO72_DIM,) or action_std.shape != (RHINO72_DIM,):
+        raise ValueError(
+            f"{context} requires 72D action stats, got "
+            f"mean={action_mean.shape} std={action_std.shape}"
+        )
+    if not np.isfinite(action_mean).all() or not np.isfinite(action_std).all():
+        raise ValueError(f"{context} action stats must be finite")
+    if np.any(action_std <= 0):
+        raise ValueError(f"{context} action_std must be strictly positive")
+    return action_mean, action_std
+
+
+def _resolve_batch_action_norm_stats(vla_cfg, examples) -> tuple[np.ndarray, np.ndarray]:
+    """Broadcast the one global 72D action normalization to a batch."""
+    action_mean, action_std = _validated_action_stats(vla_cfg, context="Native72 eval")
+    batch_size = len(examples)
+    return (
+        np.broadcast_to(action_mean, (batch_size, RHINO72_DIM)).copy(),
+        np.broadcast_to(action_std, (batch_size, RHINO72_DIM)).copy(),
+    )
+
+
 class _EvalMixin:
     """Validation methods for VLATrainer."""
 
@@ -54,12 +80,6 @@ class _EvalMixin:
 
         vla_cfg = self.config.datasets.vla_data
         n_eval_batches = int(vla_cfg.get("n_eval_batches", 4))
-        action_mean = np.asarray(vla_cfg.get("action_mean", None), dtype=np.float32)
-        action_std = np.asarray(vla_cfg.get("action_std", None), dtype=np.float32)
-        if action_mean.shape[-1] != RHINO72_DIM or action_std.shape[-1] != RHINO72_DIM:
-            raise ValueError(
-                f"Native72 eval requires 72D action stats, got mean={action_mean.shape} std={action_std.shape}"
-            )
 
         metric_prefix = "ema_" if use_ema else ""
         raw_model = self.accelerator.unwrap_model(self.model)
@@ -88,9 +108,24 @@ class _EvalMixin:
 
                 if self.accelerator.is_main_process:
                     pred_np = pred_actions.detach().float().cpu().numpy()
-                    pred_np = pred_np * action_std[None, None, :] + action_mean[None, None, :]
+                    batch_action_mean, batch_action_std = _resolve_batch_action_norm_stats(
+                        vla_cfg,
+                        examples,
+                    )
+                    if pred_np.shape[0] != batch_action_mean.shape[0]:
+                        raise ValueError(
+                            "native72 eval prediction batch does not match examples: "
+                            f"pred={pred_np.shape[0]} examples={batch_action_mean.shape[0]}"
+                        )
+                    pred_np = (
+                        pred_np * batch_action_std[:, None, :]
+                        + batch_action_mean[:, None, :]
+                    )
 
-                    gt = np.asarray([ex.get("action_raw", ex["action"]) for ex in examples], dtype=np.float32)
+                    gt = np.asarray(
+                        [ex["action_raw"] if "action_raw" in ex else ex["action"] for ex in examples],
+                        dtype=np.float32,
+                    )
                     mask = np.asarray([ex["action_mask"] for ex in examples], dtype=np.float32)
                     if gt.shape[-1] != RHINO72_DIM or mask.shape[-1] != RHINO72_DIM:
                         raise ValueError(f"native72 eval expected 72D gt/mask, got gt={gt.shape} mask={mask.shape}")

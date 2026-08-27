@@ -195,6 +195,7 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
             accelerator=self.accelerator,
             output_dir=Path(self.config.output_dir),
             apply_initial_phase=False,
+            qwen_processor=getattr(getattr(self.accelerator.unwrap_model(self.model), "qwen", None), "processor", None),
         )
         self.vla_train_dataloader = self.accelerator.prepare(new_loader)
         self.vla_epoch_count = 0
@@ -379,6 +380,58 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
             return
         if int(getattr(self, "completed_steps", 0) or 0) <= 0:
             return
+
+        # A raw torch DataLoader exposes the custom mixture sampler directly,
+        # while Accelerate may nest it below one or two batch-sampler wrappers.
+        # Find it by capability instead of depending on wrapper class names.
+        candidates = [self.vla_train_dataloader]
+        seen: set[int] = set()
+        mixture_sampler = None
+        while candidates:
+            candidate = candidates.pop(0)
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            if (
+                hasattr(candidate, "epoch_samples")
+                and callable(getattr(candidate, "set_epoch", None))
+                and callable(getattr(candidate, "set_resume_position", None))
+            ):
+                mixture_sampler = candidate
+                break
+            for attr in ("sampler", "batch_sampler", "base_dataloader"):
+                nested = getattr(candidate, attr, None)
+                if nested is not None:
+                    candidates.append(nested)
+
+        if mixture_sampler is not None:
+            epoch_samples = int(mixture_sampler.epoch_samples)
+            if epoch_samples <= 0:
+                raise ValueError(
+                    f"mixture sampler epoch_samples must be positive, got {epoch_samples}"
+                )
+            global_batch = int(self._calculate_total_batch_size())
+            consumed_samples = int(self.completed_steps) * global_batch
+            epoch, resume_position = divmod(consumed_samples, epoch_samples)
+            mixture_sampler.set_epoch(epoch)
+            mixture_sampler.set_resume_position(resume_position)
+            # DataLoaderShard calls set_epoch(self.iteration) again when its
+            # generator first advances.  Align the wrapper so that idempotent
+            # same-epoch propagation preserves the resume position.
+            if hasattr(self.vla_train_dataloader, "iteration"):
+                self.vla_train_dataloader.iteration = epoch
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "[resume] mixture sampler seeks epoch=%s position=%s "
+                    "(completed_steps=%s x global_batch=%s, epoch_samples=%s)",
+                    epoch,
+                    resume_position,
+                    self.completed_steps,
+                    global_batch,
+                    epoch_samples,
+                )
+            return
+
         ds = getattr(self.vla_train_dataloader, "dataset", None)
         order = getattr(ds, "_order", None)
         if ds is None or order is None or len(order) == 0:
@@ -444,6 +497,7 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
                     payload[key] = list(val) if hasattr(val, "__iter__") and not isinstance(val, str) else val
             if vla_cfg.get("action_type", None) is not None:
                 payload["action_type"] = str(vla_cfg.get("action_type"))
+
             _atomic_json_dump(payload, path_without_ext + "_norm_stats.json")
         except Exception as e:
             logger.warning(f"Failed to save norm_stats sidecar: {e}")
@@ -605,7 +659,6 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
                 do_tf_eval = self.completed_steps % tf_interval == 0
 
                 if do_light_eval:
-                    torch.cuda.empty_cache()
                     step_metrics = self.eval_action_model(step_metrics)
                     # VLM input prompt cards on the val cadence (same as light eval).
                     self._log_vlm_prompt_cards(self.vla_train_dataloader.dataset, self._swanlab_step())
@@ -619,7 +672,6 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
                             self._log_tf_error_curves(use_ema=True)
                         self._restore_from_ema(backup)
                         self.accelerator.unwrap_model(self.model).train()
-                    torch.cuda.empty_cache()
 
                 step_wall_sec = t_end_model - float(timing_accum["wall_start"])
                 step_data_sec = float(timing_accum["data_sec"])
@@ -795,6 +847,7 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
                     "dataset_active_dim_mean/",
                     "dataset_loss_dim_equiv_mean/",
                     "dataset_weighted_loss_dim_equiv_mean/",
+                    "rtc/",
                     "qwen/",
                     "time/",
                 )
@@ -928,7 +981,7 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
 
     def _finalize_training(self):
         """Training end processing."""
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and getattr(self.config.trainer, "save_final_model", True):
             save_format = getattr(self.config.trainer, "save_format", "pt")
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
             os.makedirs(final_checkpoint, exist_ok=True)
@@ -983,7 +1036,16 @@ def main(cfg) -> None:
     )
     # Freeze/unfreeze before building optimizer groups so the optimizer only sees the final trainable set.
     vla = TrainerUtils.freeze_backbones(vla, freeze_modules=freeze_modules)
-    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla = TrainerUtils.configure_torch_compile(
+        vla,
+        bool(cfg.trainer.get("compile_action_expert", False)),
+    )
+    vla_train_dataloader = prepare_data(
+        cfg=cfg,
+        accelerator=accelerator,
+        output_dir=output_dir,
+        qwen_processor=getattr(getattr(vla, "qwen", None), "processor", None),
+    )
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(

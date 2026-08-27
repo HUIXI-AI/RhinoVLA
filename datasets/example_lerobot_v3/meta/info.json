@@ -1,6 +1,6 @@
 {
   "codebase_version": "v3.0",
-  "robot_type": "agibot_g2",
+  "robot_type": "example_robot",
   "total_episodes": 1,
   "total_frames": 300,
   "total_tasks": 1,

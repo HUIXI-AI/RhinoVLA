@@ -38,17 +38,20 @@ def create_sinusoidal_pos_embedding(
     min_period: float = 4e-3,
     max_period: float = 4.0,
 ) -> Tensor:
-    """Rhino scalar timestep embedding."""
+    """Rhino timestep embedding for scalar or per-action-token times."""
     if dimension % 2 != 0:
         raise ValueError(f"dimension must be even, got {dimension}")
-    if time.ndim != 1:
-        raise ValueError(f"time must be shape (B,), got {tuple(time.shape)}")
+    if time.ndim not in (1, 2):
+        raise ValueError(f"time must be shape (B,) or (B,H), got {tuple(time.shape)}")
 
+    original_shape = tuple(time.shape)
+    flat_time = time.reshape(-1)
     dtype = torch.float64 if time.device.type != "cpu" else torch.float32
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=time.device)
     period = min_period * (max_period / min_period) ** fraction
-    phase = time[:, None].to(dtype) * (2 * math.pi / period)[None, :]
-    return torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1).to(torch.float32)
+    phase = flat_time[:, None].to(dtype) * (2 * math.pi / period)[None, :]
+    emb = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1).to(torch.float32)
+    return emb.reshape(*original_shape, dimension)
 
 
 def make_suffix_attn_mask(prefix_mask: Tensor, suffix_mask: Tensor) -> Tensor:
@@ -164,8 +167,18 @@ class AdaRMSNorm(nn.Module):
         if self.cond is None or cond is None:
             return hidden_states, None
         scale, shift, gate = self.cond(cond).chunk(3, dim=-1)
-        hidden_states = hidden_states * (1 + scale[:, None, :]) + shift[:, None, :]
-        return hidden_states, gate[:, None, :]
+        if cond.ndim == 2:
+            hidden_states = hidden_states * (1 + scale[:, None, :]) + shift[:, None, :]
+            return hidden_states, gate[:, None, :]
+        if cond.ndim == 3:
+            if cond.shape[:2] != hidden_states.shape[:2]:
+                raise ValueError(
+                    f"per-token cond shape {tuple(cond.shape[:2])} does not match hidden states "
+                    f"{tuple(hidden_states.shape[:2])}"
+                )
+            hidden_states = hidden_states * (1 + scale) + shift
+            return hidden_states, gate
+        raise ValueError(f"cond must be shape (B,W) or (B,S,W), got {tuple(cond.shape)}")
 
 
 def gated_residual(residual: Tensor, update: Tensor, gate: Tensor | None) -> Tensor:
@@ -341,7 +354,17 @@ class RhinoActionIO(nn.Module):
     def embed_suffix(self, state: Tensor | None, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         action_embeds = self.action_in_proj(noisy_actions)
         time_emb = create_sinusoidal_pos_embedding(timestep, self.config.width).to(action_embeds.device, action_embeds.dtype)
-        per_action_time = time_emb[:, None, :].expand_as(action_embeds)
+        if time_emb.ndim == 2:
+            per_action_time = time_emb[:, None, :].expand_as(action_embeds)
+            adarms_cond = time_emb
+        else:
+            if time_emb.shape[:2] != action_embeds.shape[:2]:
+                raise ValueError(
+                    f"per-token timestep shape {tuple(time_emb.shape[:2])} does not match actions "
+                    f"{tuple(action_embeds.shape[:2])}"
+                )
+            per_action_time = time_emb
+            adarms_cond = time_emb
         action_time_embeds = torch.cat([action_embeds, per_action_time], dim=-1)
         action_time_embeds = self.action_time_mlp_out(F.silu(self.action_time_mlp_in(action_time_embeds)))
 
@@ -355,7 +378,10 @@ class RhinoActionIO(nn.Module):
             masks.append(torch.ones(state_token.shape[:2], dtype=torch.bool, device=state_token.device))
         tokens.append(action_time_embeds)
         masks.append(torch.ones(action_time_embeds.shape[:2], dtype=torch.bool, device=action_time_embeds.device))
-        return torch.cat(tokens, dim=1), torch.cat(masks, dim=1), time_emb
+        if adarms_cond.ndim == 3 and self.state_proj is not None:
+            state_time_cond = adarms_cond.mean(dim=1, keepdim=True)
+            adarms_cond = torch.cat([state_time_cond, adarms_cond], dim=1)
+        return torch.cat(tokens, dim=1), torch.cat(masks, dim=1), adarms_cond
 
     def decode_actions(self, suffix_hidden: Tensor) -> Tensor:
         action_hidden = suffix_hidden[:, -self.config.action_horizon :]

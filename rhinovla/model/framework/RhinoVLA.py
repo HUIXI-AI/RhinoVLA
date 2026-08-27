@@ -150,6 +150,13 @@ class RhinoVLA(nn.Module):
                 print("[Rhino] froze Qwen visual encoder", flush=True)
 
         self.num_inference_timesteps = int(getattr(action_cfg, "num_inference_timesteps", 10))
+        rtc_cfg = getattr(action_cfg, "training_time_rtc", None)
+        self.training_time_rtc_max_delay = int(getattr(rtc_cfg, "max_delay", 0)) if rtc_cfg is not None else 0
+        if not 0 <= self.training_time_rtc_max_delay < self.action_horizon:
+            raise ValueError(
+                "training_time_rtc.max_delay must be in [0, action_horizon), "
+                f"got {self.training_time_rtc_max_delay} for horizon {self.action_horizon}"
+            )
 
         # Grasp weighting: per-sample + temporal + phase-dim weights
         gw = getattr(action_cfg, "grasp_weighting", None)
@@ -324,7 +331,7 @@ class RhinoVLA(nn.Module):
         view_modalities = [example.get("view_modalities") for example in examples]
         return batch_images, instructions, view_roles, view_modalities
 
-    def _encode_prefix(self, examples: List[dict]):
+    def _encode_prefix(self, examples: List[dict], *, inference: bool = False):
         profile_timing = bool(getattr(self, "_profile_timing", False))
         self._last_prefix_timing = {}
         device = next(self.parameters()).device
@@ -372,14 +379,14 @@ class RhinoVLA(nn.Module):
             "qwen/input_pixel_value_count": float(pixel_values.numel()) if pixel_values is not None else 0.0,
         }
 
-        freeze_qwen = not any(p.requires_grad for p in self.qwen.parameters())
+        params_frozen = not any(p.requires_grad for p in self.qwen.parameters())
         qwen_forward = self.qwen.model.model
-        if freeze_qwen:
+        if params_frozen:
             base_qwen = self.qwen.model
             if hasattr(base_qwen, "get_base_model"):
                 base_qwen = base_qwen.get_base_model()
             qwen_forward = getattr(base_qwen, "model", qwen_forward)
-        context = torch.no_grad() if freeze_qwen else torch.enable_grad()
+        context = torch.no_grad() if inference or params_frozen else torch.enable_grad()
         with context:
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
                 outputs = qwen_forward(**model_inputs)
@@ -439,6 +446,62 @@ class RhinoVLA(nn.Module):
         )
         sample = sample.clamp(min=_TIME_EPSILON, max=below_one)
         return sample.to(torch.float32)
+
+    def _sample_rtc_delay(self, batch_size: int, device: torch.device) -> Tensor:
+        max_delay = int(self.training_time_rtc_max_delay)
+        if max_delay <= 0:
+            return torch.zeros(batch_size, dtype=torch.long, device=device)
+        return torch.randint(0, max_delay + 1, (batch_size,), dtype=torch.long, device=device)
+
+    def _build_rtc_prefix_mask(self, delay: Tensor, horizon: int, device: torch.device) -> Tensor:
+        delay = delay.to(device=device, dtype=torch.long)
+        if delay.ndim != 1:
+            raise ValueError(f"delay must be shape [B], got {tuple(delay.shape)}")
+        if bool((delay < 0).any()) or bool((delay > horizon).any()):
+            raise ValueError(f"delay values must be in [0, {horizon}]")
+        return torch.arange(horizon, device=device)[None, :] < delay[:, None]
+
+    def _normalize_action_prefix(
+        self,
+        action_prefix,
+        delay,
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if action_prefix is None or delay is None:
+            raise ValueError("action_prefix and delay must be provided together")
+        prefix = torch.as_tensor(action_prefix, dtype=torch.float32, device=device)
+        if prefix.ndim == 2 and batch_size == 1:
+            prefix = prefix[None, :, :]
+        if prefix.ndim != 3:
+            raise ValueError(f"action_prefix must be shape [B,D,action_dim], got {tuple(prefix.shape)}")
+        if prefix.shape[0] != batch_size:
+            raise ValueError(
+                f"action_prefix batch size {prefix.shape[0]} does not match examples batch size {batch_size}"
+            )
+        if prefix.shape[2] != self.action_dim:
+            raise ValueError(f"action_prefix action dim {prefix.shape[2]} does not match action_dim {self.action_dim}")
+
+        delay_t = torch.as_tensor(delay, dtype=torch.long, device=device)
+        if delay_t.ndim == 0:
+            delay_t = delay_t.expand(batch_size)
+        if delay_t.ndim != 1 or delay_t.shape[0] != batch_size:
+            raise ValueError(f"delay must be an int or shape [B], got {tuple(delay_t.shape)}")
+        if bool((delay_t < 0).any()) or bool((delay_t > self.action_horizon).any()):
+            raise ValueError(f"delay values must be in [0, {self.action_horizon}]")
+        max_delay = int(delay_t.max().item()) if delay_t.numel() else 0
+        if prefix.shape[1] < max_delay:
+            raise ValueError(f"action_prefix length {prefix.shape[1]} is shorter than requested delay {max_delay}")
+
+        prefix_full = torch.zeros(
+            (batch_size, self.action_horizon, self.action_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        copy_len = min(prefix.shape[1], self.action_horizon)
+        prefix_full[:, :copy_len, :] = prefix[:, :copy_len, :]
+        prefix_mask = self._build_rtc_prefix_mask(delay_t, self.action_horizon, device)
+        return prefix_full, delay_t, prefix_mask
 
     def _prepare_masked_actions(self, examples: List[dict], device: torch.device) -> tuple[Tensor, Tensor]:
         actions = torch.as_tensor(np.asarray([ex["action"] for ex in examples]), dtype=torch.float32).to(
@@ -523,9 +586,24 @@ class RhinoVLA(nn.Module):
 
         noise = self.sample_noise(actions.shape, actions.device) * action_mask
         time = self.sample_time(actions.shape[0], actions.device)
-        t = time[:, None, None]
+        rtc_delay = None
+        rtc_prefix_mask = None
+        if self.training_time_rtc_max_delay > 0:
+            rtc_delay = self._sample_rtc_delay(actions.shape[0], actions.device)
+            rtc_prefix_mask = self._build_rtc_prefix_mask(rtc_delay, self.action_horizon, actions.device)
+        time_for_model = (
+            torch.where(rtc_prefix_mask, torch.zeros_like(time[:, None]), time[:, None])
+            if rtc_prefix_mask is not None
+            else time
+        )
+        t = time_for_model[:, :, None] if time_for_model.ndim == 2 else time_for_model[:, None, None]
         x_t = (t * noise + (1 - t) * actions) * action_mask
         target_velocity = (noise - actions) * action_mask
+        loss_mask = (
+            action_mask * (~rtc_prefix_mask).to(action_mask.dtype)[:, :, None]
+            if rtc_prefix_mask is not None
+            else action_mask
+        )
 
         pred_velocity = self._action_forward_masked(
             prefix_key_values,
@@ -535,31 +613,47 @@ class RhinoVLA(nn.Module):
             state_mask,
             x_t,
             action_mask,
-            time,
+            time_for_model,
         )
         per_elem_mse = (pred_velocity - target_velocity).pow(2)
-        loss = (per_elem_mse * action_mask).sum() / action_mask.sum().clamp_min(1.0)
+        loss_numerator = (per_elem_mse * loss_mask).sum()
+        loss_denominator = loss_mask.sum().clamp_min(1.0)
+        loss = loss_numerator / loss_denominator
 
-        pred_flat = (pred_velocity * action_mask).detach().float().flatten(1)
-        target_flat = (target_velocity * action_mask).detach().float().flatten(1)
+        pred_flat = (pred_velocity * loss_mask).detach().float().flatten(1)
+        target_flat = (target_velocity * loss_mask).detach().float().flatten(1)
         per_elem_mse_det = per_elem_mse.detach().float()
-        per_dim_mse = (per_elem_mse_det * action_mask).sum(dim=(0, 1)) / action_mask.sum(dim=(0, 1)).clamp_min(1.0)
-        per_sample_mse = (per_elem_mse_det * action_mask).sum(dim=(1, 2)) / action_mask.sum(dim=(1, 2)).clamp_min(1.0)
+        loss_mask_det = loss_mask.detach().float()
+        per_dim_mse = (per_elem_mse_det * loss_mask_det).sum(dim=(0, 1)) / loss_mask_det.sum(dim=(0, 1)).clamp_min(1.0)
+        per_sample_mse = (per_elem_mse_det * loss_mask_det).sum(dim=(1, 2)) / loss_mask_det.sum(dim=(1, 2)).clamp_min(1.0)
         metrics = {
             "action_loss": loss,
             "loss_fm": loss.detach(),
-            "fm/t_mean": time.detach().mean(),
-            "fm/t_std": time.detach().std(unbiased=False),
+            "fm/t_mean": time_for_model.detach().float().mean(),
+            "fm/t_std": time_for_model.detach().float().std(unbiased=False),
             "fm/noise_norm": (noise * action_mask).detach().float().norm(dim=-1).mean(),
             "fm/action_norm": (actions * action_mask).detach().float().norm(dim=-1).mean(),
             "fm/x_t_norm": (x_t * action_mask).detach().float().norm(dim=-1).mean(),
-            "fm/target_velocity_norm": (target_velocity * action_mask).detach().float().norm(dim=-1).mean(),
-            "fm/pred_velocity_norm": (pred_velocity * action_mask).detach().float().norm(dim=-1).mean(),
+            "fm/target_velocity_norm": (target_velocity * loss_mask).detach().float().norm(dim=-1).mean(),
+            "fm/pred_velocity_norm": (pred_velocity * loss_mask).detach().float().norm(dim=-1).mean(),
             "fm/velocity_mse": loss.detach(),
             "fm/velocity_cosine": F.cosine_similarity(pred_flat, target_flat, dim=-1).mean(),
+            "fm/loss_numerator": loss_numerator.detach(),
+            "fm/loss_denominator": loss_denominator.detach(),
             "mask/active_dim_mean": action_mask[:, 0, :].sum(dim=-1).float().mean(),
             "mask/active_ratio": action_mask.float().mean(),
+            "mask/loss_weight_mean": loss_mask_det.mean(),
         }
+        if rtc_delay is not None and rtc_prefix_mask is not None:
+            metrics.update(
+                {
+                    "rtc/enabled": torch.tensor(1.0, device=device),
+                    "rtc/delay_mean": rtc_delay.float().mean(),
+                    "rtc/delay_max": rtc_delay.float().max(),
+                    "rtc/prefix_token_ratio": rtc_prefix_mask.float().mean(),
+                    "rtc/postfix_loss_denominator": loss_denominator.detach(),
+                }
+            )
         if state_mask is not None:
             metrics["mask/state_active_dim_mean"] = state_mask.reshape(state_mask.shape[0], -1, self.state_dim)[:, 0, :].sum(dim=-1).float().mean()
             metrics["mask/state_active_ratio"] = state_mask.float().mean()
@@ -577,11 +671,21 @@ class RhinoVLA(nn.Module):
         return metrics
 
     @torch.no_grad()
-    def predict_action(self, examples: List[dict] = None, num_steps: int | None = None, **kwargs) -> Tensor:
+    def predict_action(
+        self,
+        examples: List[dict] = None,
+        num_steps: int | None = None,
+        action_prefix=None,
+        delay=None,
+        **kwargs,
+    ) -> Tensor:
         if not examples:
             raise ValueError("examples must be a non-empty list")
         device = next(self.parameters()).device
-        prefix_key_values, prefix_mask, prefix_rope_deltas = self._encode_prefix(examples)
+        prefix_key_values, prefix_mask, prefix_rope_deltas = self._encode_prefix(
+            examples,
+            inference=True,
+        )
         bsz = prefix_mask.shape[0]
 
         state, state_mask = self._prepare_masked_state(examples, device)
@@ -599,9 +703,19 @@ class RhinoVLA(nn.Module):
 
         steps = int(num_steps or self.num_inference_timesteps)
         x_t = self.sample_noise((bsz, self.action_horizon, self.action_dim), device=device) * action_mask
+        has_prefix = action_prefix is not None or delay is not None
+        if has_prefix:
+            prefix_full, _delay_t, rtc_prefix_mask = self._normalize_action_prefix(action_prefix, delay, bsz, device)
+            prefix_full = prefix_full * action_mask_full
+            prefix_mask_3d = rtc_prefix_mask[:, :, None]
         dt = -1.0 / steps
         time = torch.ones(bsz, dtype=torch.float32, device=device)
         for _ in range(steps):
+            if has_prefix:
+                x_t = torch.where(prefix_mask_3d, prefix_full, x_t)
+                time_for_model = torch.where(rtc_prefix_mask, torch.zeros_like(time[:, None]), time[:, None])
+            else:
+                time_for_model = time
             pred_velocity = self._action_forward_masked(
                 prefix_key_values,
                 prefix_mask,
@@ -610,8 +724,10 @@ class RhinoVLA(nn.Module):
                 state_mask,
                 x_t,
                 action_mask_full,
-                time,
+                time_for_model,
             )
             x_t = (x_t + dt * pred_velocity) * action_mask
             time = (time + dt).clamp(min=0.0)
+        if has_prefix:
+            x_t = torch.where(prefix_mask_3d, prefix_full, x_t)
         return x_t

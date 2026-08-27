@@ -23,7 +23,7 @@ except ImportError:
     HAS_SWANLAB = False
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -34,13 +34,6 @@ from rhinovla.dataloader import build_dataloader
 from rhinovla.model.framework import build_framework
 from rhinovla.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from rhinovla.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, normalize_dotlist_args, resize_images
-
-# Use pure DDP without DeepSpeed; optimized for communication efficiency
-import datetime
-from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
-
-
-
 
 def _finite_float_or_none(value: Any) -> float | None:
     try:
@@ -182,21 +175,6 @@ def _format_72d_mask_lines(mask_row: Any) -> tuple[str, str, str, str, str]:
     )
 
 
-def _rhino_dataset_family(dataset_id: str) -> str:
-    text = str(dataset_id).lower()
-    if text.startswith("libero"):
-        return "LIBERO"
-    if text.startswith("unitree/") or "g1_" in text or "z1_" in text:
-        return "Unitree"
-    if "agibot_world_2026" in text:
-        return "AgiBotWorld 2026"
-    if text.startswith("robotwin2.0/") or text.startswith("robotwin2/"):
-        return "RoboTwin2"
-    if "agibot_world_beta" in text or "/task_" in text or text.startswith("task_"):
-        return "AgiBot Beta"
-    return "OXE"
-
-
 def _resize_down_keep_aspect(image, max_width: int = 720, max_height: int = 420):
     """Downscale only when needed. Never stretch to a fixed aspect ratio."""
     img = image.convert("RGB").copy()
@@ -250,87 +228,19 @@ def _render_sample_footer_frame(
 
 
 def build_accelerator(cfg) -> Accelerator:
-    """Build Accelerator with optimized DDP settings for multi-GPU training.
+    """Build the standard Accelerate CUDA/NCCL runtime.
 
-    Key optimizations:
-    - find_unused_parameters=False: Enable gradient bucketing for efficient All-Reduce
-    - static_graph=True: Enable static graph optimization (computation graph is stable)
-    - bucket_cap_mb=256: Larger buckets reduce All-Reduce frequency (default: 25MB)
-    - timeout=30min: NCCL collective watchdog window. The default 600s can trip
-      during a cold first batch (filesystem cache miss + decode workers spinning
-      up). Recent PyTorch ignores the TORCH_NCCL_DEFAULT_TIMEOUT_S / NCCL_TIMEOUT
-      env vars, and passing InitProcessGroupKwargs(timeout=...) to Accelerator
-      does not always honor it. Workaround: explicitly call
-      `dist.init_process_group(timeout=...)` BEFORE Accelerator() so the process
-      group is already initialized with the desired timeout, and Accelerator's
-      later `is_initialized()` check skips its own init.
+    Keep startup on Accelerate's standard multi-GPU path. The sole DDP option
+    is unused-parameter detection, required when selectively exercised Qwen
+    branches are trainable.
     """
     grad_accum_steps = int(getattr(cfg.trainer, "gradient_accumulation_steps", 1))
-    # static_graph=True is incompatible with gradient_accumulation_steps>1
-    use_static = grad_accum_steps <= 1
-    # bucket_cap_mb: bigger buckets coalesce gradient all-reduce -> fewer NCCL collectives/barriers
-    # -> smoother SM util under grad_accum>1. Configurable via trainer.ddp_bucket_cap_mb; default
-    # keeps legacy behavior (256 for static graph, 25 for grad_accum>1). Set 256 to opt into coalescing.
-    bucket_cap = int(getattr(cfg.trainer, "ddp_bucket_cap_mb", 0) or 0)
-    if bucket_cap <= 0:
-        bucket_cap = 256 if use_static else 25
-    ddp_kwargs = DistributedDataParallelKwargs(
-        find_unused_parameters=not use_static,
-        static_graph=use_static,
-        bucket_cap_mb=bucket_cap,
-    )
-
-    # Force NCCL watchdog timeout BEFORE Accelerator init.
-    nccl_timeout = datetime.timedelta(minutes=30)
-    print(
-        f"[build_accelerator] entry: dist.is_initialized()="
-        f"{dist.is_initialized()} (rank-pre-init diagnostic)",
-        flush=True,
-    )
-    if not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        try:
-            dist.init_process_group(backend=backend, timeout=nccl_timeout)
-            print(
-                f"[build_accelerator] dist.init_process_group("
-                f"backend={backend}, timeout={nccl_timeout}) — explicit pre-Accelerator init",
-                flush=True,
-            )
-        except Exception as e:
-            # Fall back to Accelerator's own init if explicit init can't be done
-            # (e.g., env not set up). InitProcessGroupKwargs is best-effort here.
-            print(
-                f"[build_accelerator] explicit dist.init_process_group failed "
-                f"({e!r}); falling back to InitProcessGroupKwargs",
-                flush=True,
-            )
-
-    init_kwargs = InitProcessGroupKwargs(timeout=nccl_timeout)
     mixed_precision = "bf16" if getattr(cfg.trainer, "enable_mixed_precision_training", True) else "no"
     accelerator = Accelerator(
-        kwargs_handlers=[ddp_kwargs, init_kwargs],
         mixed_precision=mixed_precision,
         gradient_accumulation_steps=grad_accum_steps,
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
-
-    # Brute-force: regardless of whether pre-init / InitProcessGroupKwargs
-    # took effect, force-update timeout on the existing PG via the private
-    # API. This is the only knob that's been verified to actually move
-    # `Watchdog caught collective operation timeout: ... Timeout(ms)=N`
-    # away from the 600000ms default in PyTorch 2.10.
-    try:
-        from torch.distributed.distributed_c10d import _set_pg_timeout
-        _set_pg_timeout(nccl_timeout)
-        print(
-            f"[build_accelerator] _set_pg_timeout({nccl_timeout}) — post-init brute-force",
-            flush=True,
-        )
-    except Exception as e:
-        print(
-            f"[build_accelerator] _set_pg_timeout failed: {e!r} — relying on init-time kwargs",
-            flush=True,
-        )
-
     accelerator.print(accelerator.state)
     return accelerator
 
@@ -453,7 +363,7 @@ def _auto_parallel_index_build(cfg) -> None:
     return
 
 
-def prepare_data(cfg, accelerator, output_dir, *, apply_initial_phase: bool = True) -> DataLoader:
+def prepare_data(cfg, accelerator, output_dir, *, apply_initial_phase: bool = True, qwen_processor=None) -> DataLoader:
     """Prepare VLA training data."""
     if apply_initial_phase:
         phases = _get_data_phase_schedule(cfg)
@@ -463,7 +373,11 @@ def prepare_data(cfg, accelerator, output_dir, *, apply_initial_phase: bool = Tr
     logger.info(f"Creating VLA Dataset with Mixture `{data_mix}`")
     build_t0 = time.perf_counter()
     _auto_parallel_index_build(cfg)
-    vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+    vla_train_dataloader = build_dataloader(
+        cfg=cfg,
+        dataset_py=cfg.datasets.vla_data.dataset_py,
+        qwen_processor=qwen_processor,
+    )
     build_sec = time.perf_counter() - build_t0
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info(f"Built VLA dataloader in {build_sec:.2f}s")
@@ -536,7 +450,6 @@ __all__ = [
     "_mask_segment",
     "_mask_fingers",
     "_format_72d_mask_lines",
-    "_rhino_dataset_family",
     "_resize_down_keep_aspect",
     "_render_sample_footer_frame",
     "build_accelerator",

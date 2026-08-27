@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -16,32 +17,44 @@ except ImportError:
 from rhinovla.training._trainer_helpers import *  # noqa: F401,F403
 
 
+_METRIC_KEY_ALIASES = {
+    "data_time": "throughput/data_time",
+    "model_time": "throughput/model_time",
+    "learning_rate": "lr/learning_rate",
+}
+
+
+def canonicalize_metric_keys(metrics: dict) -> dict[str, float | str]:
+    """Return the complete metric set using the shared local/SwanLab schema."""
+
+    out: dict[str, float | str] = {}
+    for key, value in metrics.items():
+        if isinstance(value, (int, float, np.number)):
+            out[_METRIC_KEY_ALIASES.get(str(key), str(key))] = float(value)
+        elif isinstance(value, str):
+            out[_METRIC_KEY_ALIASES.get(str(key), str(key))] = value
+    return out
+
+
 def filter_swanlab_scalars(metrics: dict) -> dict[str, float]:
-    """Return the scalar curves shown on the release SwanLab page."""
+    """Select release-dashboard curves from the canonical metric schema."""
 
     numeric = {
-        k: float(v)
-        for k, v in metrics.items()
-        if isinstance(v, (int, float, np.number))
+        key: value
+        for key, value in canonicalize_metric_keys(metrics).items()
+        if isinstance(value, float)
     }
-    out: dict[str, float] = {}
+    keys = [
+        "loss/train",
+        "loss/val",
+        "throughput/data_time",
+        "throughput/model_time",
+        "lr/learning_rate",
+    ]
+    if int(numeric.get("global_step", 0)) >= 20:
+        keys.extend(("eta/remaining_hours", "eta/avg_step_sec"))
 
-    def add(new_key: str, old_key: str) -> None:
-        if old_key in numeric:
-            out[new_key] = numeric[old_key]
-
-    add("main_loss/train_total", "loss/train")
-    global_step = int(numeric.get("global_step", 0))
-    if global_step >= 20:
-        add("eta_main/remaining_hours", "eta/remaining_hours")
-        add("eta_main/avg_step_sec", "eta/avg_step_sec")
-    add("throughput/data_time", "data_time")
-    add("throughput/model_time", "model_time")
-    add("eval_main/val_loss", "loss/val")
-    add("lr/learning_rate", "learning_rate")
-    for key, value in numeric.items():
-        if str(key).startswith("lr/"):
-            out[str(key)] = value
+    out = {key: numeric[key] for key in keys if key in numeric}
     return out
 
 
@@ -103,6 +116,13 @@ class _MetricsMixin:
                 # Build config dict for SwanLab
                 from omegaconf import OmegaConf
                 swanlab_config = OmegaConf.to_container(self.config, resolve=True)
+                config_yaml = getattr(self.config, "config_yaml", None)
+                swanlab_config["runtime_paths"] = {
+                    "entrypoint": str(Path(sys.argv[0]).resolve()),
+                    "config_yaml": str(Path(str(config_yaml)).expanduser().resolve()) if config_yaml else "",
+                    "python_environment": str(Path(sys.prefix).resolve()),
+                    "python_executable": str(Path(sys.executable).resolve()),
+                }
 
                 swanlab_api_key = os.environ.get("SWANLAB_API_KEY")
                 swanlab_host, swanlab_web_host = _swanlab_login_hosts()
@@ -386,7 +406,7 @@ class _MetricsMixin:
                 except Exception as exc:  # noqa: BLE001
                     # Don't silently swallow: a SwanLab schema/serialization error or
                     # transient host failure would otherwise freeze the dashboard with no
-                    # trainer-side signal. Count it (persisted to metrics.jsonl) + rate-limit warn.
+                    # trainer-side signal. Count it and rate-limit warnings.
                     self._swanlab_log_failures = getattr(self, "_swanlab_log_failures", 0) + 1
                     metrics["swanlab/log_failed"] = float(self._swanlab_log_failures)
                     if self._swanlab_log_failures == 1 or self._swanlab_log_failures % 50 == 0:
@@ -397,12 +417,7 @@ class _MetricsMixin:
             try:
                 metrics_path = Path(self.config.output_dir) / "metrics.jsonl"
                 metrics_path.parent.mkdir(parents=True, exist_ok=True)
-                json_metrics = {}
-                for k, v in metrics.items():
-                    if isinstance(v, (int, float, np.number)):
-                        json_metrics[k] = float(v)
-                    elif isinstance(v, str):
-                        json_metrics[k] = v
+                json_metrics = canonicalize_metric_keys(metrics)
                 json_metrics["timestamp"] = time.time()
                 with metrics_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(json_metrics, ensure_ascii=False) + "\n")
@@ -414,9 +429,8 @@ class _MetricsMixin:
     def _build_swanlab_scalar_metrics(self, metrics: dict) -> dict[str, float]:
         """Return only the scalar curves requested for the release run.
 
-        Full diagnostics still go to local ``metrics.jsonl``. SwanLab is kept
-        intentionally small so the run page exposes only the comparison curves
-        needed for the public run page.
+        Local ``metrics.jsonl`` remains a diagnostic superset with the same
+        names for shared curves. SwanLab stays intentionally small.
         """
 
         return filter_swanlab_scalars(metrics)
@@ -603,6 +617,6 @@ class _MetricsMixin:
             logger.info("***** Training Configuration *****")
             logger.info(f"  Total optimization steps = {self.config.trainer.max_train_steps}")
             logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
-            logger.info(f"  Eval batch size = {self.config.datasets.vla_data.get('eval_batch_size', self.config.datasets.vla_data.per_device_batch_size)}")
+            logger.info(f"  Eval batch size = {self.config.datasets.vla_data.per_device_batch_size}")
             logger.info(f"  Gradient accumulation steps = {self.config.trainer.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")

@@ -31,6 +31,8 @@ framework:
     qwen_init_adarms_passthrough: true
     qwen_init_adarms_gate_bias: 5.0
     num_inference_timesteps: 10
+    training_time_rtc:
+      max_delay: 6
 
 datasets:
   vla_data:
@@ -64,8 +66,8 @@ trainer:
   num_warmup_steps: 1000
   save_interval: 2000
   keep_last_n_checkpoints: 6
-  eval_interval: 1000
-  tf_eval_interval: 1000
+  eval_interval: 500
+  tf_eval_interval: 500
   tf_eval_on_start: false
   learning_rate:
     base: 2.0e-5
