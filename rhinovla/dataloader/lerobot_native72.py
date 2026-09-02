@@ -1512,8 +1512,8 @@ class LeRobotNative72Dataset(Dataset):
     def decode_frame(self, global_row_idx: int) -> List[Image.Image]:
         """Decode the three canonical camera frames at an absolute parquet row.
 
-        Use the episode-local `timestamp` column instead of deriving time from
-        the global row index. Decode through the stateless helper because the
+        Use the episode-local `timestamp` column plus the packed video's
+        per-episode offset. Decode through the stateless helper because the
         dataset's stateful video query is unsafe alongside dataloader workers.
         """
         row = self.lerobot.hf_dataset[global_row_idx]
@@ -1530,10 +1530,13 @@ class LeRobotNative72Dataset(Dataset):
         root = Path(self.native_mapping.root)
         video_backend = getattr(self.lerobot, "video_backend", None) or "pyav"
         tolerance_s = float(self.lerobot.tolerance_s)
+        episode = self.lerobot.meta.episodes[ep_idx]
         out: List[Image.Image] = []
         for cam in self.camera_source_keys:
+            from_timestamp = episode[f"videos/{cam}/from_timestamp"]
+            video_t = float(from_timestamp.item() if hasattr(from_timestamp, "item") else from_timestamp) + t
             video_path = root / self.lerobot.meta.get_video_file_path(ep_idx, cam)
-            frames = decode_video_frames(str(video_path), [t], tolerance_s, video_backend)
+            frames = decode_video_frames(str(video_path), [video_t], tolerance_s, video_backend)
             tensor = frames if hasattr(frames, "dim") else frames
             if tensor.dim() == 4:
                 tensor = tensor.squeeze(0)
