@@ -1,21 +1,24 @@
-"""Native LeRobot -> RhinoVLA 72D adapter dataset.
+"""Native LeRobot -> RhinoVLA continuous-action adapter dataset.
 
 Wraps the official `LeRobotDataset` and reformats samples for the RhinoVLA
-72D training batch contract.  The mapping YAML is the single source of truth
-for source columns, view list, state/action source indices, target 72D slots,
+V3 96D training batch contract. The mapping YAML is the single source of truth
+for source columns, view list, state/action source indices, target slots,
 and mask-active slots.
 
-Per `docs/LEROBOT_DATA_PIPELINE.md`:
+Per `docs/DATA_PREPARATION.md`:
 - Sample clock is the canonical 30Hz row index. Action chunks are built by
-  slicing rows `[i : i + H]`. Chunks must not cross episode boundaries.
+  slicing rows `[i : i + H]`. Chunks do not cross episode boundaries; the
+  episode tail may be padded by configuration.
 - `valid_chunk_filter` chooses the quality gate before training:
   `episode_only` only checks episode containment, `valid_chunk_start` trusts a
   per-row `valid_chunk_start` column written by the converter, and `valid_intervals`
-  checks full chunk containment inside merged valid intervals from sidecar
-  parquet. The adapter pre-filters kept starts into `valid_global_indices`.
+  keeps chunks within merged valid intervals from sidecar parquet, optionally
+  padding interval tails. Kept starts are pre-filtered into `valid_global_indices`.
 - High-frequency raw streams (`raw/sensor_*`, `raw/target_*`) are not exposed
   to the trainer in the first version.
-- Image resize is applied here (mapping `image_size`), not at convert time.
+- Image resize is applied here: scale the short side to 256, then align to a
+  32-pixel grid with a 256*512 pixel-area cap; mapping `image_size` does not
+  control resize.
 """
 from __future__ import annotations
 
@@ -36,7 +39,7 @@ from qwen_vl_utils.vision_process import smart_resize as qwen_smart_resize
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, WeightedRandomSampler
 
 
-RHINO72_DIM = 72
+RHINO96_DIM = 96
 ACTION_TYPE_ABSOLUTE = "absolute_joint_position"
 ACTION_TYPE_DELTA = "delta_from_current_state"
 ACTION_TYPES = (ACTION_TYPE_ABSOLUTE, ACTION_TYPE_DELTA)
@@ -59,12 +62,12 @@ class SlotSpec:
     source_indices: List[int]
     target_slots: List[int]
     active_slots: List[int]
-    target_dim: int = RHINO72_DIM
+    target_dim: int = RHINO96_DIM
     value_transforms: List[str] | None = None
 
 
 @dataclass(frozen=True)
-class Native72Mapping:
+class Native96Mapping:
     raw: dict[str, Any]
     dataset_id: str
     root: str
@@ -96,6 +99,8 @@ class QwenCPUPreprocessCollator:
     allowed_modalities: tuple[str, ...]
     cot_prompt: str | None
     cot_prompt_present: bool
+    use_view_prompt: bool = True
+    prompt_template: str = "v1"
 
     def __call__(self, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not batch:
@@ -106,10 +111,12 @@ class QwenCPUPreprocessCollator:
             [example["lang"] for example in batch],
             view_roles=[example.get("view_roles") for example in batch],
             view_modalities=[example.get("view_modalities") for example in batch],
+            use_view_prompt=self.use_view_prompt,
             allowed_roles=self.allowed_roles,
             allowed_modalities=self.allowed_modalities,
             cot_prompt=self.cot_prompt,
             cot_prompt_present=self.cot_prompt_present,
+            prompt_template=self.prompt_template,
         )
         return batch
 
@@ -126,6 +133,8 @@ def build_qwen_cpu_preprocess_collator(vla_cfg: Mapping[str, Any], *, processor:
         ),
         cot_prompt=str(vla_cfg.get("CoT_prompt", "")) if "CoT_prompt" in vla_cfg else None,
         cot_prompt_present="CoT_prompt" in vla_cfg,
+        use_view_prompt=bool(vla_cfg.get("use_view_registry_prompt", True)),
+        prompt_template=vla_cfg.get("prompt_template", "v1"),
     )
 
 
@@ -258,6 +267,10 @@ def get_torchcodec_exact_cached_decoder(
         raise ValueError(f"TorchCodec decoder cache size must be positive, got {max_size}")
     key = str(video_path)
     with cache._lock:
+        # Forked workers must reopen native decoders, not share inherited file offsets.
+        if getattr(cache, "_rhinovla_pid", None) != os.getpid():
+            cache._cache.clear()
+            cache._rhinovla_pid = os.getpid()
         cached = cache._cache.pop(key, None)
         if cached is not None:
             cache._cache[key] = cached
@@ -341,8 +354,9 @@ def _resolve_action_delta_slots(
     active_state_slots: Sequence[int],
     active_action_slots: Sequence[int],
     absolute_action_slots: Sequence[int],
+    target_dim: int = RHINO96_DIM,
 ) -> list[int]:
-    """Resolve the generic action representation in Rhino72 target slots.
+    """Resolve the generic action representation in canonical target slots.
 
     In delta mode every active action slot with a same-slot state becomes a
     delta except explicitly absolute gripper opening slots. Action-only command
@@ -355,9 +369,9 @@ def _resolve_action_delta_slots(
 
     state_slots = {int(slot) for slot in active_state_slots}
     absolute_slots = {int(slot) for slot in absolute_action_slots}
-    bad_absolute = sorted(slot for slot in absolute_slots if slot < 0 or slot >= RHINO72_DIM)
+    bad_absolute = sorted(slot for slot in absolute_slots if slot < 0 or slot >= target_dim)
     if bad_absolute:
-        raise ValueError(f"absolute_action_slots out of Rhino72 range: {bad_absolute}")
+        raise ValueError(f"absolute_action_slots out of target range: {bad_absolute}")
     return [
         slot
         for slot in action_slots
@@ -561,26 +575,31 @@ def _native_slot_spec(mapping: dict[str, Any], kind: str) -> SlotSpec:
         source_indices=source_indices,
         target_slots=target_slots,
         active_slots=active_slots,
-        target_dim=int(mapping.get("target_dim", RHINO72_DIM)),
+        target_dim=int(mapping.get("target_dim", RHINO96_DIM)),
         value_transforms=transforms,
     )
 
 
-def load_lerobot_mapping(path: str | Path, dataset_id: str | None = None) -> Native72Mapping:
+def load_lerobot_mapping(
+    path: str | Path,
+    dataset_id: str | None = None,
+    *,
+    expected_dim: int | None = None,
+) -> Native96Mapping:
     raw = _load_mapping(path)
     mapping = _select_mapping_dataset(raw, dataset_id)
     views = _views_from_mapping(mapping)
     state = _native_slot_spec(mapping, "state")
     action = _native_slot_spec(mapping, "action")
-    if state.target_dim != RHINO72_DIM or action.target_dim != RHINO72_DIM:
+    if expected_dim is not None and (state.target_dim != expected_dim or action.target_dim != expected_dim):
         raise ValueError(
-            f"RhinoVLA native dataloader requires 72D target dims, got "
+            f"RhinoVLA native dataloader requires {expected_dim}D target dims, got "
             f"state={state.target_dim}, action={action.target_dim}"
         )
     root = str(mapping.get("root", ""))
     repo_id = str(mapping.get("repo_id", mapping.get("dataset_id", mapping.get("id", ""))))
     image_size = mapping.get("image_size", [256, 256])
-    return Native72Mapping(
+    return Native96Mapping(
         raw=mapping,
         dataset_id=str(mapping.get("id", mapping.get("dataset_id", ""))),
         root=root,
@@ -613,37 +632,39 @@ def _apply_value_transform(values: np.ndarray, transforms: Sequence[str] | None)
     return out
 
 
-def pack_source_to_rhino72(
+def pack_source_to_rhino96(
     values: Any,
     *,
     source_indices: Sequence[int],
     target_slots: Sequence[int],
     fill_value: float = 0.0,
     value_transforms: Sequence[str] | None = None,
+    target_dim: int = RHINO96_DIM,
 ) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float32)
     if not source_indices:
-        out_shape = (*arr.shape[:-1], RHINO72_DIM)
+        out_shape = (*arr.shape[:-1], target_dim)
         return np.full(out_shape, fill_value, dtype=np.float32)
     max_source = max(int(x) for x in source_indices)
     if arr.shape[-1] <= max_source:
         raise ValueError(f"source shape {arr.shape} does not contain source index {max_source}")
     selected = arr[..., list(source_indices)]
     selected = _apply_value_transform(selected, value_transforms)
-    out = np.full((*arr.shape[:-1], RHINO72_DIM), fill_value, dtype=np.float32)
+    out = np.full((*arr.shape[:-1], target_dim), fill_value, dtype=np.float32)
     out[..., list(target_slots)] = selected
     return out
 
 
-def expand_stats_to_rhino72(
+def expand_stats_to_rhino96(
     values: Any,
     *,
     spec: SlotSpec,
     fill_value: float,
     transform_values: bool = True,
+    target_dim: int = RHINO96_DIM,
 ) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float32)
-    if arr.shape == (RHINO72_DIM,):
+    if arr.shape == (target_dim,):
         return arr.copy()
     if arr.ndim != 1:
         raise ValueError(f"stats must be 1D, got shape {arr.shape}")
@@ -653,19 +674,19 @@ def expand_stats_to_rhino72(
         selected = arr
     else:
         raise ValueError(
-            f"cannot expand stats shape {arr.shape} into 72D: need 72, "
+            f"cannot expand stats shape {arr.shape} into {target_dim}D: need {target_dim}, "
             f"> max source index {max(spec.source_indices, default=-1)}, "
             f"or {len(spec.target_slots)} active values"
         )
     if transform_values:
         selected = _apply_value_transform(selected, spec.value_transforms)
-    out = np.full((RHINO72_DIM,), fill_value, dtype=np.float32)
+    out = np.full((target_dim,), fill_value, dtype=np.float32)
     out[list(spec.target_slots)] = selected
     return out
 
 
-def mask_from_spec(spec: SlotSpec) -> np.ndarray:
-    mask = np.zeros((RHINO72_DIM,), dtype=np.float32)
+def mask_from_spec(spec: SlotSpec, target_dim: int = RHINO96_DIM) -> np.ndarray:
+    mask = np.zeros((target_dim,), dtype=np.float32)
     mask[list(spec.active_slots)] = 1.0
     return mask
 
@@ -762,12 +783,12 @@ def _load_weight_override_table(path: str | Path):
     raise ValueError(f"unsupported sample_weight_override_path suffix: {path}")
 
 
-class Native72MixtureDataset(ConcatDataset):
-    """Concatenate native72 datasets that share one normalization contract."""
+class Native96MixtureDataset(ConcatDataset):
+    """Concatenate native96 datasets that share one normalization contract."""
 
     def __init__(self, datasets: Sequence[Dataset], source_ids: Sequence[str]) -> None:
         if not datasets:
-            raise ValueError("Native72MixtureDataset requires at least one dataset")
+            raise ValueError("Native96MixtureDataset requires at least one dataset")
         if len(datasets) != len(source_ids):
             raise ValueError(
                 f"source_ids count {len(source_ids)} must match dataset count {len(datasets)}"
@@ -797,7 +818,7 @@ class Native72MixtureDataset(ConcatDataset):
         sample = self.datasets[dataset_index][local_index]
         if not isinstance(sample, Mapping):
             raise TypeError(
-                f"native72 child dataset {dataset_index} returned {type(sample)}, expected a mapping"
+                f"native96 child dataset {dataset_index} returned {type(sample)}, expected a mapping"
             )
         result = dict(sample)
         result["_mixture_dataset_index"] = dataset_index
@@ -816,13 +837,13 @@ class DeterministicMixtureSampler(Sampler[int]):
 
     def __init__(
         self,
-        dataset: Native72MixtureDataset,
+        dataset: Native96MixtureDataset,
         dataset_weights: Sequence[float],
         epoch_samples: int,
         seed: int,
     ) -> None:
-        if not isinstance(dataset, Native72MixtureDataset):
-            raise TypeError("DeterministicMixtureSampler requires Native72MixtureDataset")
+        if not isinstance(dataset, Native96MixtureDataset):
+            raise TypeError("DeterministicMixtureSampler requires Native96MixtureDataset")
         if len(dataset_weights) != len(dataset.datasets):
             raise ValueError(
                 f"dataset_weights count {len(dataset_weights)} must match "
@@ -897,8 +918,8 @@ class DeterministicMixtureSampler(Sampler[int]):
         return self.epoch_samples - self._resume_position
 
 
-class LeRobotNative72Dataset(Dataset):
-    """Map LeRobotDataset rows into native RhinoVLA 72D training samples."""
+class LeRobotNative96Dataset(Dataset):
+    """Map LeRobotDataset rows into native RhinoVLA V3 samples."""
 
     def __init__(
         self,
@@ -918,8 +939,16 @@ class LeRobotNative72Dataset(Dataset):
         camera_dropout: Optional[Dict[str, Any]] = None,
         mapping_dataset_id: Optional[str] = None,
         action_type: str = ACTION_TYPE_ABSOLUTE,
+        target_dim: int = RHINO96_DIM,
+        pad_episode_end: bool = True,
     ) -> None:
-        self.native_mapping = load_lerobot_mapping(mapping_path, dataset_id=mapping_dataset_id)
+        self.target_dim = int(target_dim)
+        self.pad_episode_end = bool(pad_episode_end)
+        self.native_mapping = load_lerobot_mapping(
+            mapping_path,
+            dataset_id=mapping_dataset_id,
+            expected_dim=self.target_dim,
+        )
         self.mapping = self.native_mapping.raw
         if self.mapping.get("format", "lerobot") != "lerobot":
             raise ValueError(f"mapping format must be 'lerobot', got {self.mapping.get('format')!r}")
@@ -976,7 +1005,7 @@ class LeRobotNative72Dataset(Dataset):
                 flush=True,
             )
 
-        # Native 72D slot mapping. No extra 72D index cache is used: __getitem__
+        # Native slot mapping. No extra index cache is used: __getitem__
         # reads the raw source row/chunk and packs it directly according to
         # these source-index -> target-slot arrays, matching the old 16D loader
         # execution style.
@@ -1000,6 +1029,7 @@ class LeRobotNative72Dataset(Dataset):
             active_state_slots=self.state_spec.active_slots,
             active_action_slots=self.action_spec.active_slots,
             absolute_action_slots=self.absolute_action_slots,
+            target_dim=self.target_dim,
         )
         print(
             f"[LeRobotAdapter] action_type={self.action_type} "
@@ -1067,22 +1097,22 @@ class LeRobotNative72Dataset(Dataset):
             )
 
         # Loss mask (optional, broadcast at training time). Accept either a
-        # full 72D mask or active-slot values in mapping order.
+        # full target-dim mask or active-slot values in mapping order.
         loss_cfg = self.mapping.get("loss", {}) or {}
         loss_mask_cfg = loss_cfg.get("action_loss_mask", None)
         if loss_mask_cfg is None:
-            self.action_loss_mask = mask_from_spec(self.action_spec)
+            self.action_loss_mask = mask_from_spec(self.action_spec, self.target_dim)
         else:
             raw_loss_mask = np.asarray(loss_mask_cfg, dtype=np.float32)
-            if raw_loss_mask.shape == (RHINO72_DIM,):
+            if raw_loss_mask.shape == (self.target_dim,):
                 self.action_loss_mask = raw_loss_mask
             elif raw_loss_mask.shape == (len(self.action_spec.target_slots),):
-                self.action_loss_mask = np.zeros((RHINO72_DIM,), dtype=np.float32)
+                self.action_loss_mask = np.zeros((self.target_dim,), dtype=np.float32)
                 self.action_loss_mask[list(self.action_spec.target_slots)] = raw_loss_mask
             else:
                 raise ValueError(
                     f"loss.action_loss_mask shape {raw_loss_mask.shape} must be "
-                    f"({RHINO72_DIM},) or ({len(self.action_spec.target_slots)},)"
+                    f"({self.target_dim},) or ({len(self.action_spec.target_slots)},)"
                 )
 
         # ----- Build the underlying LeRobotDataset -----
@@ -1146,6 +1176,10 @@ class LeRobotNative72Dataset(Dataset):
         # We avoid loading frames here — only need the integer columns from
         # each episode's parquet. LeRobot's hf_dataset exposes them directly.
         ep_arr = _hf_column_to_1d_array(self.lerobot.hf_dataset, "episode_index", np.int64)
+        self._valid_frames_remaining = np.zeros(len(ep_arr), dtype=np.int64)
+        for episode in np.unique(ep_arr):
+            rows = np.flatnonzero(ep_arr == episode)
+            self._valid_frames_remaining[rows] = len(rows) - np.arange(len(rows))
 
         if self.valid_chunk_filter == "valid_chunk_start":
             # valid_chunk_start: use the converter's frame/start-level boolean
@@ -1154,13 +1188,15 @@ class LeRobotNative72Dataset(Dataset):
             # dataset parquet to contain `self.valid_chunk_key`.
             valid_mask = _hf_column_to_1d_array(self.lerobot.hf_dataset, self.valid_chunk_key, np.int64)
         elif self.valid_chunk_filter == "episode_only":
-            # episode_only: do not use validity annotations. Row i is valid iff
-            # the H-frame action chunk [i, i + H) stays within one episode. This
-            # keeps plain jsonl/LeRobot conversions trainable even when no extra
-            # quality columns or sidecars exist.
+            # episode_only: do not use validity annotations. With end padding,
+            # every row inside an episode is a valid start; LeRobot marks the
+            # missing tail timesteps in action_is_pad.
             n_rows = len(ep_arr)
-            valid_mask = np.zeros(n_rows, dtype=np.int64)
-            if n_rows >= self.action_horizon:
+            if self.pad_episode_end:
+                valid_mask = np.ones(n_rows, dtype=np.int64)
+            else:
+                valid_mask = np.zeros(n_rows, dtype=np.int64)
+            if not self.pad_episode_end and n_rows >= self.action_horizon:
                 # Broadcast check: for an H-step contiguous table, same
                 # episode_index at the first and last rows is enough to prove
                 # the chunk does not cross an episode boundary.
@@ -1174,7 +1210,11 @@ class LeRobotNative72Dataset(Dataset):
             # overlap annotated invalid/mistake/error regions while still
             # allowing chunks to cross touching action-segment boundaries.
             frame_arr = _hf_column_to_1d_array(self.lerobot.hf_dataset, "frame_index", np.int64)
-            valid_mask = self._valid_intervals_mask(ep_arr, frame_arr)
+            valid_mask = self._valid_intervals_mask(
+                ep_arr,
+                frame_arr,
+                allow_tail_padding=self.pad_episode_end,
+            )
 
         if self.episodes_filter is not None:
             episode_mask = np.isin(ep_arr, np.asarray(self.episodes_filter, dtype=np.int64))
@@ -1195,7 +1235,8 @@ class LeRobotNative72Dataset(Dataset):
             f"[LeRobotAdapter] mapping={self.mapping['id']} "
             f"valid_chunk_filter={self.valid_chunk_filter} "
             f"episodes={ep_summary} valid_chunk_starts={len(self.valid_global_indices)} "
-            f"action_horizon={self.action_horizon} root={self.mapping['root']}",
+            f"action_horizon={self.action_horizon} pad_episode_end={self.pad_episode_end} "
+            f"root={self.mapping['root']}",
             flush=True,
         )
 
@@ -1330,7 +1371,13 @@ class LeRobotNative72Dataset(Dataset):
             return Path(configured_path)
         return Path(self.native_mapping.root) / "meta" / default_name
 
-    def _valid_intervals_mask(self, ep_arr: np.ndarray, frame_arr: np.ndarray) -> np.ndarray:
+    def _valid_intervals_mask(
+        self,
+        ep_arr: np.ndarray,
+        frame_arr: np.ndarray,
+        *,
+        allow_tail_padding: bool = False,
+    ) -> np.ndarray:
         """Return H-window starts fully contained in merged valid intervals.
 
         Sidecars are built from manifest label_info.action_config. The interval
@@ -1388,9 +1435,14 @@ class LeRobotNative72Dataset(Dataset):
                 continue
             frames = frame_arr[idx]
             for s, e in merged:
-                if e - s < self.action_horizon:
-                    continue
-                keep = (frames >= s) & ((frames + self.action_horizon) <= e)
+                keep = np.zeros(frames.shape, dtype=bool)
+                if e - s >= self.action_horizon:
+                    keep = (frames >= s) & ((frames + self.action_horizon) <= e)
+                if allow_tail_padding:
+                    # Any valid interval tail may be sampled; __getitem__ repeats
+                    # its last valid action for the missing part of the window.
+                    keep |= (frames >= s) & (frames < e)
+                    self._valid_frames_remaining[idx[keep]] = e - frames[keep]
                 valid_mask[idx[keep]] = 1
 
         segment_path = self._resolve_sidecar_path(self.segment_table_path, "episode_segments.parquet")
@@ -1453,19 +1505,21 @@ class LeRobotNative72Dataset(Dataset):
                 absolute_action_slots=self.absolute_action_slots,
             )
             return (
-                expand_stats_to_rhino72(selected_stats["action_mean"], spec=self.action_spec, fill_value=0.0),
-                expand_stats_to_rhino72(
+                expand_stats_to_rhino96(selected_stats["action_mean"], spec=self.action_spec, fill_value=0.0, target_dim=self.target_dim),
+                expand_stats_to_rhino96(
                     selected_stats["action_std"],
                     spec=self.action_spec,
                     fill_value=1.0,
                     transform_values=False,
+                    target_dim=self.target_dim,
                 ),
-                expand_stats_to_rhino72(selected_stats["state_mean"], spec=self.state_spec, fill_value=0.0),
-                expand_stats_to_rhino72(
+                expand_stats_to_rhino96(selected_stats["state_mean"], spec=self.state_spec, fill_value=0.0, target_dim=self.target_dim),
+                expand_stats_to_rhino96(
                     selected_stats["state_std"],
                     spec=self.state_spec,
                     fill_value=1.0,
                     transform_values=False,
+                    target_dim=self.target_dim,
                 ),
             )
 
@@ -1476,37 +1530,39 @@ class LeRobotNative72Dataset(Dataset):
             )
 
         # Otherwise compute over the full dataset's native source columns and
-        # expand into 72D. Production configs normally provide norm.json and do
+        # expand into the target dimension. Production configs normally provide norm.json and do
         # not use this fallback.
         states_src = _hf_vector_column_to_array(self.lerobot.hf_dataset, self.state_source_key, np.float32)
         actions_src = _hf_vector_column_to_array(self.lerobot.hf_dataset, self.action_source_key, np.float32)
-        states = pack_source_to_rhino72(
+        states = pack_source_to_rhino96(
             states_src,
             source_indices=self.state_spec.source_indices,
             target_slots=self.state_spec.target_slots,
             fill_value=0.0,
             value_transforms=self.state_spec.value_transforms,
+            target_dim=self.target_dim,
         )
-        actions = pack_source_to_rhino72(
+        actions = pack_source_to_rhino96(
             actions_src,
             source_indices=self.action_spec.source_indices,
             target_slots=self.action_spec.target_slots,
             fill_value=0.0,
             value_transforms=self.action_spec.value_transforms,
+            target_dim=self.target_dim,
         )
         state_mean = states.mean(axis=0).astype(np.float32)
         state_std = np.maximum(states.std(axis=0), 1e-6).astype(np.float32)
-        state_std[np.asarray(mask_from_spec(self.state_spec)) < 0.5] = 1.0
+        state_std[np.asarray(mask_from_spec(self.state_spec, self.target_dim)) < 0.5] = 1.0
         action_mean = actions.mean(axis=0).astype(np.float32)
         action_std = np.maximum(actions.std(axis=0), 1e-6).astype(np.float32)
-        action_std[np.asarray(mask_from_spec(self.action_spec)) < 0.5] = 1.0
+        action_std[np.asarray(mask_from_spec(self.action_spec, self.target_dim)) < 0.5] = 1.0
         return action_mean, action_std, state_mean, state_std
 
     def _validate_stats(self) -> None:
         for name, arr in (("action_mean", self.action_mean), ("action_std", self.action_std),
                           ("state_mean", self.state_mean), ("state_std", self.state_std)):
-            if arr.shape != (RHINO72_DIM,):
-                raise ValueError(f"norm stat '{name}' shape {arr.shape} != ({RHINO72_DIM},)")
+            if arr.shape != (self.target_dim,):
+                raise ValueError(f"norm stat '{name}' shape {arr.shape} != ({self.target_dim},)")
 
     # --------------------------- viz/debug helpers (no augmentation/norm) --
     def decode_frame(self, global_row_idx: int) -> List[Image.Image]:
@@ -1561,19 +1617,21 @@ class LeRobotNative72Dataset(Dataset):
         row = self.lerobot.hf_dataset[global_row_idx]
         state_src = np.asarray(row[self.state_source_key], dtype=np.float32)
         action_src = np.asarray(row[self.action_source_key], dtype=np.float32)
-        state_raw = pack_source_to_rhino72(
+        state_raw = pack_source_to_rhino96(
             state_src,
             source_indices=self.state_spec.source_indices,
             target_slots=self.state_spec.target_slots,
             fill_value=0.0,
             value_transforms=self.state_spec.value_transforms,
+            target_dim=self.target_dim,
         )
-        action_abs_raw = pack_source_to_rhino72(
+        action_abs_raw = pack_source_to_rhino96(
             action_src,
             source_indices=self.action_spec.source_indices,
             target_slots=self.action_spec.target_slots,
             fill_value=0.0,
             value_transforms=self.action_spec.value_transforms,
+            target_dim=self.target_dim,
         )
         action_raw = _action_to_model_space(
             action_abs_raw,
@@ -1784,15 +1842,23 @@ class LeRobotNative72Dataset(Dataset):
         global_i = self.valid_global_indices[idx]
         sample = self.lerobot[global_i]
 
-        # No-pad invariant: every valid_chunk_filter mode must keep only starts
-        # whose H-step action chunk fits inside the episode.
+        # LeRobot returns a fixed H-step action tensor. For a padded tail, keep
+        # the target supervised by repeating the last valid action.
         pad_key = f"{self.action_source_key}_is_pad"
+        pad_mask = np.zeros((self.action_horizon,), dtype=bool)
         if pad_key in sample:
-            pad = sample[pad_key]
-            if torch.is_tensor(pad) and pad.any():
+            pad_value = sample[pad_key]
+            if torch.is_tensor(pad_value):
+                pad_value = pad_value.detach().cpu().numpy()
+            pad_mask = np.asarray(pad_value, dtype=bool).reshape(-1)
+            if pad_mask.shape != (self.action_horizon,):
                 raise RuntimeError(
-                    f"adapter idx {idx} (global {global_i}) produced a padded action chunk despite "
-                    f"valid_chunk_filter={self.valid_chunk_filter}; converter and loader are out of sync."
+                    f"action padding shape {pad_mask.shape} != ({self.action_horizon},)"
+                )
+            if pad_mask.any() and not self.pad_episode_end:
+                raise RuntimeError(
+                    f"adapter idx {idx} (global {global_i}) produced a padded action chunk while "
+                    "pad_episode_end=false"
                 )
 
         state_raw_source = sample[self.state_source_key].cpu().numpy().astype(np.float32)
@@ -1802,20 +1868,29 @@ class LeRobotNative72Dataset(Dataset):
                 f"action chunk shape {action_raw_source.shape} != "
                 f"(action_horizon={self.action_horizon}, <source_dim>)"
             )
+        if self.pad_episode_end:
+            remaining = int(self._valid_frames_remaining[global_i])
+            if remaining < 1:
+                raise RuntimeError("sample start has no valid action frames")
+            if remaining < self.action_horizon:
+                action_raw_source = action_raw_source.copy()
+                action_raw_source[remaining:] = action_raw_source[remaining - 1]
 
-        state_raw = pack_source_to_rhino72(
+        state_raw = pack_source_to_rhino96(
             state_raw_source,
             source_indices=self.state_spec.source_indices,
             target_slots=self.state_spec.target_slots,
             fill_value=0.0,
             value_transforms=self.state_spec.value_transforms,
+            target_dim=self.target_dim,
         )
-        action_abs_raw = pack_source_to_rhino72(
+        action_abs_raw = pack_source_to_rhino96(
             action_raw_source,
             source_indices=self.action_spec.source_indices,
             target_slots=self.action_spec.target_slots,
             fill_value=0.0,
             value_transforms=self.action_spec.value_transforms,
+            target_dim=self.target_dim,
         )
         action_raw = _action_to_model_space(
             action_abs_raw,
@@ -1824,8 +1899,8 @@ class LeRobotNative72Dataset(Dataset):
         )
         normalized_state = (state_raw - self.state_mean) / self.state_std
         normalized_action = (action_raw - self.action_mean[None, :]) / self.action_std[None, :]
-        action_mask = np.broadcast_to(mask_from_spec(self.action_spec), normalized_action.shape).copy()
-        state_mask = np.broadcast_to(mask_from_spec(self.state_spec), normalized_state[None, :].shape).copy()
+        action_mask = np.broadcast_to(mask_from_spec(self.action_spec, self.target_dim), normalized_action.shape).copy()
+        state_mask = np.broadcast_to(mask_from_spec(self.state_spec, self.target_dim), normalized_state[None, :].shape).copy()
 
         roles = getattr(self, "view_roles", None) or self.camera_order
         pil_images = [
@@ -1906,7 +1981,7 @@ def _resolve_lerobot_stats(vla_cfg, split: str) -> Optional[Dict[str, Any]]:
     """Return configured normalization stats, or None when fallback is allowed.
 
     Raises a fatal error if `norm_stats_path` is configured but the file is
-    missing AND `allow_norm_stats_fallback` is not set to true. Native72
+    missing AND `allow_norm_stats_fallback` is not set to true. Native continuous-action
     training must not silently drift away from the normalization file.
     """
     norm_stats_path = vla_cfg.get("norm_stats_path", None)
@@ -1972,16 +2047,16 @@ def _resolve_episode_filter(vla_cfg, split: str) -> Optional[list[int]]:
     return None
 
 
-def validate_native72_mixture_config(
+def validate_native96_mixture_config(
     vla_cfg: Any,
     *,
     split: str,
     global_batch_size: int,
 ) -> list[dict[str, Any]]:
-    """Validate a native72 mixture before constructing any video datasets."""
+    """Validate a native96 mixture before constructing any video datasets."""
     mixture_cfg = vla_cfg.get("mixture", None)
     if not mixture_cfg:
-        raise ValueError("vla_data.mixture is required for native72 mixture validation")
+        raise ValueError("vla_data.mixture is required for native96 mixture validation")
     entries_cfg = mixture_cfg.get("datasets", None)
     if not entries_cfg:
         raise ValueError("vla_data.mixture.datasets must contain at least one dataset")
@@ -2046,7 +2121,9 @@ def validate_native72_mixture_config(
 
         mapping_dataset_id = str(entry["mapping_dataset_id"])
         try:
-            mapping = load_lerobot_mapping(mapping_path, dataset_id=mapping_dataset_id)
+            mapping = load_lerobot_mapping(
+                mapping_path, dataset_id=mapping_dataset_id, expected_dim=RHINO96_DIM
+            )
         except KeyError as exc:
             raise KeyError(
                 f"mixture dataset {dataset_id!r} mapping_dataset_id "
@@ -2074,6 +2151,7 @@ def validate_native72_mixture_config(
             active_state_slots=mapping.state.active_slots,
             active_action_slots=mapping.action.active_slots,
             absolute_action_slots=absolute_action_slots,
+            target_dim=mapping.action.target_dim,
         )
         selected_norm = _select_action_norm_stats(
             norm,
@@ -2117,7 +2195,7 @@ def _build_mixture_dataloader(cfg: Any, vla_cfg: Any, split: str, **kwargs: Any)
     global_batch_size = int(
         kwargs.get("global_batch_size", per_device_batch_size * world_size)
     )
-    entries = validate_native72_mixture_config(
+    entries = validate_native96_mixture_config(
         vla_cfg,
         split=split,
         global_batch_size=global_batch_size,
@@ -2131,7 +2209,7 @@ def _build_mixture_dataloader(cfg: Any, vla_cfg: Any, split: str, **kwargs: Any)
         raise ValueError("vla_data config must be a mapping")
     base_cfg.pop("mixture", None)
 
-    datasets: list[LeRobotNative72Dataset] = []
+    datasets: list[LeRobotNative96Dataset] = []
     source_ids: list[str] = []
     dataset_weights: list[float] = []
     for entry in entries:
@@ -2144,7 +2222,7 @@ def _build_mixture_dataloader(cfg: Any, vla_cfg: Any, split: str, **kwargs: Any)
         image_size = entry_cfg.get("image_size", [256, 256])
         image_size = list(image_size) if hasattr(image_size, "__iter__") else [int(image_size)]
         aug_profile = str(entry_cfg.get("image_aug_profile", "none")) if split == "train" else "none"
-        dataset = LeRobotNative72Dataset(
+        dataset = LeRobotNative96Dataset(
             mapping_path=entry_cfg.mapping_path,
             action_horizon=int(entry_cfg.get("action_horizon", 30)),
             stats_override=stats_override,
@@ -2167,6 +2245,7 @@ def _build_mixture_dataloader(cfg: Any, vla_cfg: Any, split: str, **kwargs: Any)
             ),
             mapping_dataset_id=entry_cfg.mapping_dataset_id,
             action_type=str(entry_cfg.action_type),
+            pad_episode_end=bool(entry_cfg.get("pad_episode_end", True)),
         )
         view_roles = entry_cfg.get("view_roles", None)
         view_modalities = entry_cfg.get("view_modalities", None)
@@ -2178,7 +2257,7 @@ def _build_mixture_dataloader(cfg: Any, vla_cfg: Any, split: str, **kwargs: Any)
 
     if not datasets:
         return None
-    dataset = Native72MixtureDataset(datasets=datasets, source_ids=source_ids)
+    dataset = Native96MixtureDataset(datasets=datasets, source_ids=source_ids)
 
     if split == "train":
         primary = datasets[0]
@@ -2226,14 +2305,15 @@ def _build_mixture_dataloader(cfg: Any, vla_cfg: Any, split: str, **kwargs: Any)
 
 def build_dataloader(
     cfg,
-    dataset_py: str = "lerobot_native72",
+    dataset_py: str = "lerobot_native96",
     split: str = "train",
     *,
     qwen_processor: Any | None = None,
     **_kwargs,
 ) -> DataLoader | None:
-    if dataset_py != "lerobot_native72":
+    if dataset_py != "lerobot_native96":
         raise ValueError(f"Unsupported dataset_py: {dataset_py}")
+    target_dim = RHINO96_DIM
 
     vla_cfg = cfg.datasets.vla_data
     if vla_cfg.get("mixture", None):
@@ -2246,7 +2326,7 @@ def build_dataloader(
         )
     mapping_path = vla_cfg.get("mapping_path", None)
     if not mapping_path:
-        raise ValueError("vla_data.mapping_path is required for dataset_py=lerobot_native72")
+        raise ValueError(f"vla_data.mapping_path is required for dataset_py={dataset_py}")
 
     stats_override = _resolve_lerobot_stats(vla_cfg, split=split)
     episodes_filter = _resolve_episode_filter(vla_cfg, split=split)
@@ -2267,7 +2347,7 @@ def build_dataloader(
     # Disable augmentation for val — we want deterministic metrics.
     aug_profile = str(vla_cfg.get("image_aug_profile", "none")) if split == "train" else "none"
 
-    dataset = LeRobotNative72Dataset(
+    dataset = LeRobotNative96Dataset(
         mapping_path=mapping_path,
         action_horizon=int(vla_cfg.get("action_horizon", 30)),
         stats_override=stats_override,
@@ -2284,6 +2364,8 @@ def build_dataloader(
         sample_weight_override_mode=str(vla_cfg.get("sample_weight_override_mode", "replace")),
         mapping_dataset_id=vla_cfg.get("mapping_dataset_id", None),
         action_type=str(vla_cfg.get("action_type", ACTION_TYPE_ABSOLUTE)),
+        target_dim=target_dim,
+        pad_episode_end=bool(vla_cfg.get("pad_episode_end", True)),
     )
 
     # Per-camera labels are attached to every example so the compact view prompt

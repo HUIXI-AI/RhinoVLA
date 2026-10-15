@@ -1,9 +1,9 @@
 run_id: demo_full_finetune
 run_root_dir: outputs/demo_full_finetune
 run_note: |
-  Full-finetune recipe using the default dynamic image geometry, compact view
-  prompt, corrected multimodal RoPE positions, and OpenPI flow path. Qwen text
-  layers and the Action Expert train while the vision encoder stays frozen.
+  Full-finetune demo recipe copied from configs/training/demo_ae_finetune.yaml and aligned
+  with the public full-finetune schedule. Launch with two processes for the
+  intended 2-GPU setup, for example: accelerate launch --num_processes 2.
 seed: 42
 trackers: [jsonl]
 
@@ -17,8 +17,8 @@ framework:
     image_min_pixels: 65536
     image_max_pixels: 131072
   action_expert:
-    action_dim: 72
-    state_dim: 72
+    action_dim: 96
+    state_dim: 96
     action_horizon: 30
     width: 1024
     depth: 18
@@ -36,18 +36,18 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_native72
-    mapping_path: configs/data_mappings/demo_lerobot_native72.yaml
+    dataset_py: lerobot_native96
+    mapping_path: configs/data_mappings/demo_lerobot_native96.yaml
     mapping_dataset_id: example_lerobot_v3
     norm_stats_path: datasets/example_lerobot_v3/meta/norm.json
-    action_type: absolute_joint_position
     per_device_batch_size: 16
     load_all_data_for_training: true
     obs: [head_rgb, left_rgb, right_rgb]
     camera_names: [head_rgb, left_rgb, right_rgb]
     video_backend: pyav
     action_horizon: 30
-    state_dim: 72
+    state_dim: 96
+    pad_episode_end: true
     image_size: [256, 256]
     image_aug_profile: strong_light_safe_color
     num_workers: 6
@@ -55,6 +55,8 @@ datasets:
     prefetch_factor: 1
     pin_memory: true
     n_eval_batches: 4
+    prompt_template: v2
+    use_view_registry_prompt: true
     view_role_vocab: [side, hand, top_head, hand_left, hand_right, head, head_center, head_left, head_right, head_back, back_left, back_right]
     view_modality_vocab: [rgb, fisheye]
     view_roles: [top_head, hand_left, hand_right]
@@ -66,9 +68,10 @@ trainer:
   num_warmup_steps: 1000
   save_interval: 2000
   keep_last_n_checkpoints: 6
-  eval_interval: 500
-  tf_eval_interval: 500
+  eval_interval: 2000
+  tf_eval_interval: 2000
   tf_eval_on_start: false
+  attention_gif_eval: false
   learning_rate:
     base: 2.0e-5
     qwen: 2.0e-5

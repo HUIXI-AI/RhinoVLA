@@ -63,7 +63,7 @@ def resolve_prefix_rope_deltas(
 
 
 class RhinoVLA(nn.Module):
-    """Qwen3-VL prefix + Rhino 72D masked suffix denoising action expert.
+    """Qwen3-VL prefix + RhinoVLA V3 masked suffix denoising expert.
 
     Training scaffold compatibility:
       - forward(examples) returns {"action_loss": loss, ...}
@@ -73,16 +73,19 @@ class RhinoVLA(nn.Module):
     def __init__(self, config=None, **kwargs):
         super().__init__()
         self.config = config
+        action_cfg = config.framework.action_expert
+        if getattr(action_cfg, "use_adarms", True) is not True:
+            raise ValueError("RhinoVLA V3 requires use_adarms=true: AdaRMS is the only timestep conditioning path")
         self.qwen = build_qwen(config=self.config)
 
         qwen_text_config = self.qwen.model.config.text_config
-        action_cfg = config.framework.action_expert
+        expected_dim = 96
         self.action_horizon = int(getattr(action_cfg, "action_horizon", getattr(action_cfg, "future_action_window_size", 29) + 1))
-        self.action_dim = int(getattr(action_cfg, "action_dim", 72))
-        self.state_dim = int(getattr(action_cfg, "state_dim", 72))
-        if self.action_dim != 72 or self.state_dim != 72:
+        self.action_dim = int(getattr(action_cfg, "action_dim", expected_dim))
+        self.state_dim = int(getattr(action_cfg, "state_dim", expected_dim))
+        if self.action_dim != expected_dim or self.state_dim != expected_dim:
             raise ValueError(
-                f"RhinoVLA requires action_dim=72 and state_dim=72, "
+                f"RhinoVLA V3 requires action_dim=state_dim={expected_dim}, "
                 f"got action_dim={self.action_dim} state_dim={self.state_dim}"
             )
 
@@ -102,7 +105,6 @@ class RhinoVLA(nn.Module):
             depth=expert_depth,
             mlp_dim=int(getattr(action_cfg, "mlp_dim", 3072)),
             use_state_token=bool(getattr(action_cfg, "use_state_token", True)),
-            use_adarms=bool(getattr(action_cfg, "use_adarms", True)),
             use_mask_condition=bool(getattr(action_cfg, "use_mask_condition", False)),
         )
         self.action_expert = RhinoActionExpert(
@@ -152,6 +154,10 @@ class RhinoVLA(nn.Module):
         self.num_inference_timesteps = int(getattr(action_cfg, "num_inference_timesteps", 10))
         rtc_cfg = getattr(action_cfg, "training_time_rtc", None)
         self.training_time_rtc_max_delay = int(getattr(rtc_cfg, "max_delay", 0)) if rtc_cfg is not None else 0
+        if rtc_cfg is not None and not bool(getattr(rtc_cfg, "enabled", True)):
+            self.training_time_rtc_max_delay = 0
+        if rtc_cfg is not None and str(getattr(rtc_cfg, "delay_sampling", "uniform")) != "uniform":
+            raise ValueError("RTC supports uniform delay_sampling")
         if not 0 <= self.training_time_rtc_max_delay < self.action_horizon:
             raise ValueError(
                 "training_time_rtc.max_delay must be in [0, action_horizon), "
@@ -509,7 +515,10 @@ class RhinoVLA(nn.Module):
             non_blocking=True,
         )
         if actions.ndim != 3:
-            raise ValueError(f"RhinoVLA expects action [B,H,72], got {tuple(actions.shape)}")
+            raise ValueError(
+                "RhinoVLA V3 expects action "
+                f"[B,H,{self.action_dim}], got {tuple(actions.shape)}"
+            )
         actions = actions[:, -self.action_horizon :, : self.action_dim]
         if actions.shape[1:] != (self.action_horizon, self.action_dim):
             raise ValueError(

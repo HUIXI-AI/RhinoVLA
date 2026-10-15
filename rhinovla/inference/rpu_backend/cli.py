@@ -86,7 +86,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", "--train-config", dest="train_config", required=True, help="training config YAML")
     parser.add_argument("--checkpoint", required=True, help="trained RhinoVLA checkpoint")
     parser.add_argument("--norm-stats", required=True, help="matching norm.json or checkpoint norm sidecar")
-    parser.add_argument("--mapping", default=None, help="native72 mapping YAML for native-dim norm stats")
+    parser.add_argument("--mapping", default=None, help="native96 mapping YAML for native-dim norm stats")
     parser.add_argument("--mapping-dataset-id", default=None)
     parser.add_argument("--instruction", required=True)
     parser.add_argument("--image", action="append", required=True, help="image path, repeat in view order")

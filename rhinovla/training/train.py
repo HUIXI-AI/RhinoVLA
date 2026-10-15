@@ -95,7 +95,14 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
 
         self._init_val_dataloader()
         self._init_ema()
+        self._visualization_sync_group = None
+        if self.accelerator.num_processes > 1:
+            timeout = int(getattr(self.config.trainer, "visualization_sync_timeout_sec", 3600))
+            self._visualization_sync_group = dist.new_group(
+                backend="gloo", timeout=datetime.timedelta(seconds=timeout)
+            )
         self._init_trackers()
+        self._wait_for_main_visualization()
 
     def _init_ema(self):
         """Initialize EMA (Exponential Moving Average) for trainable parameters only."""
@@ -601,6 +608,11 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
 
         return batch_vla
 
+    def _wait_for_main_visualization(self):
+        """Keep non-main ranks out of NCCL while rank 0 writes heavy figures."""
+        if self._visualization_sync_group is not None:
+            dist.barrier(group=self._visualization_sync_group)
+
     def train(self):
         """Execute training loop."""
         self._log_training_config()
@@ -608,7 +620,9 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
         self._eta_start_time = time.time()
         self._eta_start_step = self.completed_steps
         progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            total=self.config.trainer.max_train_steps,
+            initial=self.completed_steps,
+            disable=not self.accelerator.is_local_main_process,
         )
 
         while self.completed_steps < self.config.trainer.max_train_steps:
@@ -656,22 +670,29 @@ class VLATrainer(TrainerUtils, _EvalMixin, _MetricsMixin, _VizMixin):
                     self.config.trainer.eval_interval,
                 ))
                 do_light_eval = self.completed_steps % self.config.trainer.eval_interval == 0
+                do_light_eval |= self.completed_steps == 1 and bool(
+                    getattr(self.config.trainer, "validation_on_first_step", False)
+                )
                 do_tf_eval = self.completed_steps % tf_interval == 0
 
                 if do_light_eval:
+                    torch.cuda.empty_cache()
                     step_metrics = self.eval_action_model(step_metrics)
                     # VLM input prompt cards on the val cadence (same as light eval).
                     self._log_vlm_prompt_cards(self.vla_train_dataloader.dataset, self._swanlab_step())
                     if do_tf_eval:
                         self._log_tf_error_curves(use_ema=False)
                         self._log_attention_figure()
+                    self._wait_for_main_visualization()
                     if self._ema_params:
                         backup = self._apply_ema()
                         step_metrics = self.eval_action_model(step_metrics, use_ema=True)
                         if do_tf_eval:
                             self._log_tf_error_curves(use_ema=True)
+                            self._wait_for_main_visualization()
                         self._restore_from_ema(backup)
                         self.accelerator.unwrap_model(self.model).train()
+                    torch.cuda.empty_cache()
 
                 step_wall_sec = t_end_model - float(timing_accum["wall_start"])
                 step_data_sec = float(timing_accum["data_sec"])

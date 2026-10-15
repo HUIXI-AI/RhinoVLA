@@ -1,4 +1,4 @@
-"""Normalization stats and native72 mapping helpers for RPU inference."""
+"""Normalization stats and native96 mapping helpers for RPU inference."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import numpy as np
 import yaml
 
 
-RHINO72_DIM = 72
+RHINO96_DIM = 96
 
 
 @dataclass(frozen=True)
@@ -20,7 +20,7 @@ class SlotMapping:
     target_slots: list[int]
     value_transforms: list[str]
     active_slots: list[int]
-    target_dim: int = RHINO72_DIM
+    target_dim: int = RHINO96_DIM
 
 
 @dataclass(frozen=True)
@@ -54,11 +54,13 @@ class NormStats:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         stats = cls.from_dict(data, unnorm_key=unnorm_key)
         if mapping_path is not None:
-            stats = stats.expand_native72_mapping(mapping_path, mapping_dataset_id=mapping_dataset_id)
+            stats = stats.expand_native96_mapping(mapping_path, mapping_dataset_id=mapping_dataset_id)
         return stats
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, unnorm_key: str | None = None) -> "NormStats":
+        if data.get("action_type", "absolute_joint_position") != "absolute_joint_position" or data.get("action_delta_from_state_dims"):
+            raise ValueError("RPU inference currently supports absolute_joint_position only, not delta actions")
         if all(k in data for k in ("state_mean", "state_std", "action_mean", "action_std")):
             state_mean = data["state_mean"]
             state_std = data["state_std"]
@@ -87,14 +89,16 @@ class NormStats:
             active_action_slots=_read_active_slots(data, "action"),
         )
 
-    def expand_native72_mapping(
+    def expand_native96_mapping(
         self,
         mapping_path: str | Path,
         *,
         mapping_dataset_id: str | None = None,
     ) -> "NormStats":
         mapping = _select_mapping_dataset(_load_mapping(mapping_path), mapping_dataset_id)
-        target_dim = int(mapping.get("target_dim", RHINO72_DIM))
+        target_dim = int(mapping.get("target_dim", RHINO96_DIM))
+        if target_dim != RHINO96_DIM:
+            raise ValueError(f"V3 RPU mapping requires target_dim=96, got {target_dim}")
         state_mapping = _native_slot_mapping(mapping, "state", target_dim)
         action_mapping = _native_slot_mapping(mapping, "action", target_dim)
         return NormStats(

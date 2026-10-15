@@ -24,17 +24,30 @@
 
 RhinoVLA 是辉羲智能自研的跨本体 VLA 系统，面向机器人本体端实时控制设计。技术报告展示了辉羲自研 VLA、辉羲 R1 芯片，以及智元、银河通用机器人组成的模型-芯片-机器人部署链路。
 
-RhinoVLA 在辉羲 R1 芯片上实现了 **11.69Hz** 端到端推理频率，跨过机器人实时闭环控制常用的 10Hz 门槛。同时，RhinoVLA 通过统一状态-动作接口和实例适配机制，支持同一策略迁移到不同机器人平台。
+技术报告记录了 RhinoVLA 在辉羲 R1 芯片上 **11.69Hz** 的端到端推理频率及跨本体部署结果。这些既有结果不代表本分支 V3 的验证结果。
+
+## 最新动态
+
+- [2026-10-15] 发布了 RhinoVLA-V3 版本，动作/状态空间扩展至 96D，新增双臂末端执行器（EEF）控制及人形机器人腿足关节槽位，并使用更多机器人数据进行预训练。
+- [2026-08-27] 支持 Training RTC（[Training-Time Action Conditioning for Efficient Real-Time Chunking](https://www.alphaxiv.org/pdf/2512.05964)）；训练配置通过 `framework.action_expert.training_time_rtc.max_delay` 指定最大 prefix 长度（训练时在 0 到该值之间采样）。
+- [2026-07-30] 扩充训练数据和训练步数，支持动态图像宽高比，并优化图像 patch 的 RoPE 位置计算。
+- [2026-07-08] 首次发布 RhinoVLA 预训练权重和微调代码。
+
+V2 已冻结；本分支仅支持 V3，不兼容 V2 权重。
 
 ## 主要特性
 
-- **端侧实时部署**：围绕机器人本体端运行设计，在 R1 芯片上实现实时 VLA 推理。
+- **端侧部署接口**：提供 RPU backend wrapper；V3 部署需匹配的 backend 与 artifact，见 [部署说明](docs/RPU_BACKEND_INFERENCE.md)。
 - **算法-系统联合优化**：采用 Qwen3-VL Backbone + Action Expert 结构，并结合芯片、算子和运行时优化降低端侧开销。
-- **跨本体适配**：通过 View Registry、72D 状态-动作接口和 Instance LoRA 处理视觉输入、动作接口和机器人实例差异。
+- **跨本体适配**：通过 View Registry 和统一的 V3 96D 状态-动作接口处理视觉输入与动作空间差异。
+
+<details>
+<summary>技术报告原始架构（非本分支 V3 微调结构）</summary>
 
 <p align="center">
-  <img src="assets/rhinovla_architecture.png" alt="RhinoVLA architecture" width="95%" />
+  <img src="assets/rhinovla_architecture.png" alt="RhinoVLA technical report architecture" width="95%" />
 </p>
+</details>
 
 ## 🚀 快速开始 Quickstart
 
@@ -43,31 +56,27 @@ RhinoVLA 在辉羲 R1 芯片上实现了 **11.69Hz** 端到端推理频率，跨
 
 ### 预训练权重
 
-预训练参数统一从 Hugging Face 下载: [HuixiAI/RhinoVLA](https://huggingface.co/HuixiAI/RhinoVLA)。
-也可从 ModelScope 下载: [huixiAI/RhinoVLA](https://www.modelscope.cn/models/huixiAI/RhinoVLA)。
+V3 发布仓库：[ModelScope](https://www.modelscope.cn/models/huixiAI/RhinoVLA-V3) ·
+[Hugging Face](https://huggingface.co/HuixiAI/RhinoVLA-V3)。
 
-将与当前代码结构匹配的预训练权重下载到本仓库的 `checkpoints/` 后即可微调。默认配置加载
-`trainer.pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt`。
-权重的 model card、license 和使用限制以 Hugging Face 仓库页面为准。
-
-## 最新动态
-
-- [2026-08-27] 支持 Training RTC（[Training-Time Action Conditioning for Efficient Real-Time Chunking](https://www.alphaxiv.org/pdf/2512.05964)）；训练配置通过 `framework.action_expert.training_time_rtc.max_delay` 指定最大 prefix 长度（训练时在 0 到该值之间采样）。
-- [2026-07-30] 扩充训练数据和训练步数，支持动态图像宽高比，并优化图像 patch 的 RoPE 位置计算。
-- [2026-07-08] 首次发布 RhinoVLA 预训练权重和微调代码。
+下载 V3 权重后，将 `trainer.pretrained_checkpoint`
+设为实际 V3 checkpoint，具体步骤见 [Finetuning Guide](docs/FINETUNING_GUIDE.md)。
+权重格式、model card、license 和使用限制以发布仓库为准。
 
 ### 仓库结构
 
 - `rhinovla/`：核心 Python 包，包含模型框架、Qwen3-VL 封装、Action Expert、LeRobot 数据加载和训练逻辑。
 - `rhinovla/assets/qwen3_vl_processor/`：本地 Qwen3-VL processor / tokenizer 配置。
-- `configs/training/`：冻结视觉编码器的全参数微调配置。
-- `configs/data_mappings/`：LeRobot v3 原始 state/action 字段到 RhinoVLA 72D slots 的 mapping。
-- `datasets/example_lerobot_v3/`：可直接跑通 `demo_full_finetune.yaml` 的最小 LeRobot v3 示例数据。
+- `configs/training/`：训练配置，包括 Action Expert 微调、全参微调。
+- `configs/data_mappings/`：LeRobot v3 原始 state/action 字段到 RhinoVLA V3 96D canonical slots 的 mapping。
+- `datasets/example_lerobot_v3/`：可直接跑通 `demo_ae_finetune.yaml` 的最小 LeRobot v3 示例数据。
 - `checkpoints/`：预训练权重。
 - `scripts/train/`：训练启动脚本。
 - `docs/`：微调说明文档。
 
 ## 🎬 演示 Demo
+
+以下为项目既有演示，不作为本分支 V3 的验证结果。
 
 ### Galbot G1：指令跟随
 
@@ -96,7 +105,7 @@ RhinoVLA 运行在智元 G1 与辉羲 R1 芯片上，完成双臂柔性物体操
 ## 📦 Release Plan
 
 - [x] 模型训练代码
-- [x] 模型参数
+- [x] V3 模型参数：见上方发布仓库。
 
 ## 📄 Citation
 

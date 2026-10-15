@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
+from omegaconf import OmegaConf
 
 from rhinovla.inference.rpu_backend.norm import NormStats
 
@@ -55,7 +56,12 @@ class RhinoVLARPUBackendExecutor:
         artifact_strict: bool = False,
         noise_seed: int = 0,
     ) -> None:
-        from rpu_backend.api import RhinoVLAPolicy
+        config_path = train_config or (runtime_env or {}).get("RHINOVLA_CONFIG")
+        if config_path:
+            config = OmegaConf.load(config_path)
+            action_type = OmegaConf.select(config, "datasets.vla_data.action_type", default="absolute_joint_position")
+            if action_type != "absolute_joint_position":
+                raise ValueError("RPU inference currently supports absolute_joint_position only, not delta actions")
 
         self._prepare_artifact = str(prepare_artifact)
         self._train_config = str(train_config) if train_config is not None else None
@@ -70,6 +76,8 @@ class RhinoVLARPUBackendExecutor:
         )
         self._action_dim = self._norm.action_dim
         self._state_dim = self._norm.state_dim
+        if self._action_dim != 96 or self._state_dim != 96:
+            raise ValueError("V3 RPU inference requires 96D state/action stats; provide a 96D mapping for source-space stats")
         self._active_slots = self._default_active_slots(active_slots)
         self._active_state_slots = self._default_active_state_slots()
         self._view_roles = [str(x) for x in (view_roles or DEFAULT_RPU_VIEW_ROLES)]
@@ -87,6 +95,8 @@ class RhinoVLARPUBackendExecutor:
             train_config=self._train_config,
             checkpoint=self._checkpoint,
         )
+        from rpu_backend.api import RhinoVLAPolicy
+
         self._policy = (
             RhinoVLAPolicy.from_prepare_artifact(
                 self._prepare_artifact,
@@ -171,8 +181,6 @@ class RhinoVLARPUBackendExecutor:
             return [int(x) for x in active_slots]
         if self._norm.active_action_slots is not None:
             return [int(x) for x in self._norm.active_action_slots]
-        if self._action_dim >= 72:
-            return list(range(16))
         return list(range(self._action_dim))
 
     def _default_active_state_slots(self) -> list[int]:

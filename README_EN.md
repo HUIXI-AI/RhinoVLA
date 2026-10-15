@@ -24,19 +24,29 @@
 
 RhinoVLA is a self-developed cross-embodiment VLA system from Huixi AI, designed for real-time robot control on edge devices. The technical report presents a model-chip-robot deployment stack built with RhinoVLA, the Huixi R1 chip, and real robots from AgiBot and Galbot.
 
-RhinoVLA reaches **11.69Hz** end-to-end inference on the Huixi R1 chip, crossing the 10Hz threshold commonly used for real-time robot closed-loop control. It also supports transfer across different robot platforms through a unified state-action interface and lightweight instance adaptation.
+The technical report records **11.69Hz** end-to-end inference on the Huixi R1 chip and cross-embodiment deployment results. These earlier results are not validation results for V3 on this branch.
+
+## Latest News
+
+- [2026-10-15] Released RhinoVLA-V3 with a 96D action/state space, adding slots for dual-arm end-effector (EEF) control and humanoid leg and foot joints, and pretrained on more robot data.
+
+V2 is frozen. This branch supports V3 only and is incompatible with V2 weights.
 
 ## Key Features
 
-- **Real-time edge deployment**: designed for robot-side VLA inference on the Huixi R1 chip.
+- **Edge deployment interface**: provides an RPU backend wrapper; V3 requires a matching backend and artifact. See [deployment notes](docs/RPU_BACKEND_INFERENCE.md).
 
 - **Algorithm-system co-optimization**: combines a Qwen3-VL Backbone, an Action Expert, and chip/runtime optimization for lower edge-side cost.
 
-- **Cross-embodiment adaptation**: uses View Registry, a 72D state-action interface, and Instance LoRA to handle visual-input, action-interface, and robot-instance differences.
+- **Cross-embodiment adaptation**: uses View Registry and a unified V3 96D state-action interface to handle visual-input and action-space differences.
+
+<details>
+<summary>Original technical report architecture (not this branch's V3 finetuning model)</summary>
 
 <p align="center">
-  <img src="assets/rhinovla_architecture.png" alt="RhinoVLA architecture" width="95%" />
+  <img src="assets/rhinovla_architecture.png" alt="RhinoVLA technical report architecture" width="95%" />
 </p>
+</details>
 
 ## 🚀 Quickstart
 
@@ -46,31 +56,27 @@ For dataset preparation, see [Data Preparation](docs/DATA_PREPARATION.md).
 
 ### Pretrained weights
 
-Download pretrained weights from Hugging Face:
-[HuixiAI/RhinoVLA](https://huggingface.co/HuixiAI/RhinoVLA).
-The weights are also available on ModelScope:
-[huixiAI/RhinoVLA](https://www.modelscope.cn/models/huixiAI/RhinoVLA).
+V3 release repositories: [ModelScope](https://www.modelscope.cn/models/huixiAI/RhinoVLA-V3) ·
+[Hugging Face](https://huggingface.co/HuixiAI/RhinoVLA-V3).
 
-Put a pretrained checkpoint compatible with the current model structure in this
-repository's `checkpoints/`. The default configs load
-`trainer.pretrained_checkpoint: checkpoints/rhinovla_pretrain.ckpt`.
-The weight model card, license, and usage notes are maintained on the Hugging
-Face repository page.
+After downloading, set `trainer.pretrained_checkpoint` to the actual V3 checkpoint;
+see the [Finetuning Guide](docs/FINETUNING_GUIDE.md).
+Consult the release repositories for weight formats, model cards, licenses, and usage restrictions.
 
 ### Repository layout
 
 - `rhinovla/`: core Python package with model framework, Qwen3-VL wrapper, Action Expert, LeRobot dataloading, and training logic.
 - `rhinovla/assets/qwen3_vl_processor/`: local Qwen3-VL processor / tokenizer configuration.
-- `configs/training/`: full-parameter finetuning config with the vision encoder frozen.
-- `configs/data_mappings/`: mappings from raw LeRobot v3 state/action fields to RhinoVLA 72D slots.
-- `datasets/example_lerobot_v3/`: minimal LeRobot v3 demo dataset for `demo_full_finetune.yaml`.
+- `configs/training/`: training configs, including Action Expert finetuning and full-parameter finetuning.
+- `configs/data_mappings/`: mappings from raw LeRobot v3 state/action fields to RhinoVLA V3 96D canonical slots.
+- `datasets/example_lerobot_v3/`: minimal LeRobot v3 demo dataset for `demo_ae_finetune.yaml`.
 - `checkpoints/`: pretrained weights.
 - `scripts/train/`: training launch scripts.
 - `docs/`: finetuning documentation.
 
 ## 🎬 Demo
 
-RhinoVLA has been demonstrated on multiple real robot platforms:
+These earlier project demonstrations are not validation results for V3 on this branch.
 
 ### Galbot G1: Instruction following
 
@@ -98,10 +104,8 @@ RhinoVLA runs on AgiBot G1 with the Huixi R1 chip and completes a bimanual defor
 
 ## 📦 Release Plan
 
-The repository is being organized and will progressively release:
-
 - [x] Model training code
-- [x] Model parameters
+- [x] V3 model parameters: see the release repositories above.
 
 ## 📄 Citation
 

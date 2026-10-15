@@ -16,17 +16,10 @@ from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
 
-IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
 VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
-
-# Qwen3-VL tokenizer vocabulary range reserved by the FAST-action variant.
-# Plain RhinoVLA finetuning does not emit action tokens; this range is used
-# only when optional text labels contain serialized action tokens.
-_ACTION_TOKEN_MIN = 151669
-_ACTION_TOKEN_MAX = 153716
 
 _DEFAULT_VIEW_ROLE_VOCAB = (
     "image",
@@ -84,13 +77,14 @@ def _build_qwenvl_messages_cpu(
     *,
     images,
     instructions,
-    solutions=None,
     view_roles=None,
     view_modalities=None,
+    use_view_prompt: bool = True,
     allowed_roles=_DEFAULT_VIEW_ROLE_VOCAB,
     allowed_modalities=_DEFAULT_VIEW_MODALITY_VOCAB,
     cot_prompt=None,
     cot_prompt_present: bool = False,
+    prompt_template: str = "v1",
 ):
     """Stateless mirror of Qwen._build_qwenvl_messages.
 
@@ -98,6 +92,9 @@ def _build_qwenvl_messages_cpu(
     instance). `cot_prompt_present` reproduces the `if "CoT_prompt" in vla_data:` KEY-PRESENCE test
     (NOT truthiness) so missing-key vs empty-string semantics match the in-forward path exactly.
     """
+    prompt_template = str(prompt_template or "v1").strip().lower()
+    if prompt_template not in {"v1", "v2"}:
+        raise ValueError(f"prompt_template must be 'v1' or 'v2', got {prompt_template!r}")
     messages = []
     assert len(images) == len(instructions), "Images and instructions must have the same length"
     allowed_roles = set(allowed_roles)
@@ -110,26 +107,42 @@ def _build_qwenvl_messages_cpu(
         else:
             prompt = instruction
 
-        roles = (view_roles or [None] * len(images))[sample_idx] or []
-        modalities = (view_modalities or [None] * len(images))[sample_idx] or []
-        for image_idx, img in enumerate(imgs):
-            role = str(roles[image_idx]) if image_idx < len(roles) else ("front" if image_idx == 0 else "external")
-            modality = str(modalities[image_idx]) if image_idx < len(modalities) else "rgb"
-            if role not in allowed_roles:
-                raise ValueError(f"Unknown view role '{role}'. Allowed roles: {sorted(allowed_roles)}")
-            if modality not in allowed_modalities:
-                raise ValueError(
-                    f"Unknown view modality '{modality}'. Allowed modalities: {sorted(allowed_modalities)}"
-                )
-            newline = "" if image_idx == 0 else "\n"
-            content.append({"type": "text", "text": f"{newline}[{role}|{modality}]"})
-            content.append({"type": "image", "image": img})
-        content.append({"type": "text", "text": f"\n{prompt}"})
+        if use_view_prompt and prompt_template == "v2":
+            roles = (view_roles or [None] * len(images))[sample_idx] or []
+            modalities = (view_modalities or [None] * len(images))[sample_idx] or []
+            for image_idx, img in enumerate(imgs):
+                role = str(roles[image_idx]) if image_idx < len(roles) else ("front" if image_idx == 0 else "external")
+                modality = str(modalities[image_idx]) if image_idx < len(modalities) else "rgb"
+                if role not in allowed_roles:
+                    raise ValueError(f"Unknown view role '{role}'. Allowed roles: {sorted(allowed_roles)}")
+                if modality not in allowed_modalities:
+                    raise ValueError(
+                        f"Unknown view modality '{modality}'. Allowed modalities: {sorted(allowed_modalities)}"
+                    )
+                newline = "" if image_idx == 0 else "\n"
+                content.append({"type": "text", "text": f"{newline}[{role}|{modality}]"})
+                content.append({"type": "image", "image": img})
+            content.append({"type": "text", "text": f"\n{prompt}"})
+        elif use_view_prompt:
+            content.append({"type": "text", "text": f"Task: {prompt}\n\nViews:"})
+            roles = (view_roles or [None] * len(images))[sample_idx] or []
+            modalities = (view_modalities or [None] * len(images))[sample_idx] or []
+            for image_idx, img in enumerate(imgs):
+                role = str(roles[image_idx]) if image_idx < len(roles) else ("front" if image_idx == 0 else "external")
+                modality = str(modalities[image_idx]) if image_idx < len(modalities) else "rgb"
+                if role not in allowed_roles:
+                    raise ValueError(f"Unknown view role '{role}'. Allowed roles: {sorted(allowed_roles)}")
+                if modality not in allowed_modalities:
+                    raise ValueError(
+                        f"Unknown view modality '{modality}'. Allowed modalities: {sorted(allowed_modalities)}"
+                    )
+                content.append({"type": "text", "text": f"[{role} | {modality}]"})
+                content.append({"type": "image", "image": img})
+        else:
+            content = [{"type": "image", "image": img} for img in imgs]
+            content.append({"type": "text", "text": prompt})
         msg = [{"role": "user", "content": content}]
 
-        if solutions is not None:
-            solution = solutions[len(messages)]
-            msg.append({"role": "assistant", "content": [{"type": "text", "text": solution}]})
         messages.append(msg)
     return messages
 
@@ -139,33 +152,34 @@ def build_qwenvl_cpu_inputs(
     images,
     instructions,
     *,
-    solutions=None,
     view_roles=None,
     view_modalities=None,
+    use_view_prompt: bool = True,
     allowed_roles=_DEFAULT_VIEW_ROLE_VOCAB,
     allowed_modalities=_DEFAULT_VIEW_MODALITY_VOCAB,
     cot_prompt=None,
     cot_prompt_present: bool = False,
+    prompt_template: str = "v1",
 ):
     """CPU-only Qwen3-VL input build, byte-identical to Qwen.build_qwenvl_inputs up to
     (but NOT including) the .to(device) transfer. Shared by the in-forward interface AND the dataloader
     worker collate so the two paths run the SAME code -> parity by construction.
 
-    Returns a CPU BatchFeature (input_ids / attention_mask / pixel_values / image_grid_thw,
-    + labels iff solutions is not None).
+    Returns a CPU BatchFeature (input_ids / attention_mask / pixel_values / image_grid_thw).
     """
     vision_process_kwargs = {"image_patch_size": 16}
 
     messages = _build_qwenvl_messages_cpu(
         images=images,
         instructions=instructions,
-        solutions=solutions,
         view_roles=view_roles,
         view_modalities=view_modalities,
+        use_view_prompt=use_view_prompt,
         allowed_roles=allowed_roles,
         allowed_modalities=allowed_modalities,
         cot_prompt=cot_prompt,
         cot_prompt_present=cot_prompt_present,
+        prompt_template=prompt_template,
     )
     # Two-step path (verbatim from build_qwenvl_inputs): render text first, then let the processor
     # batch/pad text + vision tensors together. tokenize=True chat-template path is avoided.
@@ -182,22 +196,6 @@ def build_qwenvl_cpu_inputs(
         return_tensors="pt",
         do_resize=False,
     )
-    # if solutions, mask out the solution tokens in labels (training path is solutions=None -> skipped)
-    if solutions is not None:
-        action_token_min = _ACTION_TOKEN_MIN
-        action_token_max = _ACTION_TOKEN_MAX
-        labels = batch_inputs["input_ids"].clone()
-        for i in range(labels.size(0)):
-            seq = labels[i]
-            mask_seq = (seq >= action_token_min) & (seq <= action_token_max)
-            nonzero_indices = torch.nonzero(mask_seq, as_tuple=False)
-            if nonzero_indices.numel() > 0:
-                first_action_index = nonzero_indices[0].item()
-                seq[:first_action_index] = IGNORE_INDEX
-            else:
-                seq[:] = IGNORE_INDEX
-        labels[labels == processor.tokenizer.pad_token_id] = -100
-        batch_inputs["labels"] = labels
     return batch_inputs
 
 
@@ -216,6 +214,8 @@ class Qwen(nn.Module):
         super().__init__()
 
         qwenvl_config = config.framework.get("qwenvl", {})
+        if qwenvl_config.get("lora_rank", 0) != 0:
+            raise ValueError("RhinoVLA V3 does not support VLM LoRA; framework.qwenvl.lora_rank must be 0")
         model_id = qwenvl_config.get("base_vlm", "rhinovla/assets/qwen3_vl_processor")
         attn_implementation = qwenvl_config.get("attn_implementation", "flash_attention_2")
         model_path = Path(str(model_id))
@@ -251,32 +251,12 @@ class Qwen(nn.Module):
         )
         processor.tokenizer.padding_side = "left"
 
-        # Apply LoRA if configured
-        lora_rank = getattr(qwenvl_config, "lora_rank", 0)
-        if lora_rank and int(lora_rank) > 0:
-            from peft import LoraConfig, get_peft_model
-            lora_config = LoraConfig(
-                r=int(lora_rank),
-                lora_alpha=int(getattr(qwenvl_config, "lora_alpha", int(lora_rank) * 2)),
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-                lora_dropout=float(getattr(qwenvl_config, "lora_dropout", 0.05)),
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            model = get_peft_model(model, lora_config)
-            model.print_trainable_parameters()
-
         self.model = model
         self.processor = processor
         self.config = config
 
         # alin qwen3 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
-
-        # only for fast base model
-        if "-Action" in model_id:
-            self._ACTION_TOKEN_MIN = _ACTION_TOKEN_MIN
-            self._ACTION_TOKEN_MAX = _ACTION_TOKEN_MAX
 
     def forward(
         self,
@@ -316,7 +296,6 @@ class Qwen(nn.Module):
         *,
         images: list[list[Any]],
         instructions: list[str],
-        solutions: list[str] | None = None,
         view_roles: list[list[str]] | None = None,
         view_modalities: list[list[str]] | None = None,
     ) -> list[list[dict[str, Any]]]:
@@ -330,22 +309,25 @@ class Qwen(nn.Module):
         return _build_qwenvl_messages_cpu(
             images=images,
             instructions=instructions,
-            solutions=solutions,
             view_roles=view_roles,
             view_modalities=view_modalities,
+            use_view_prompt=bool(vla_data.get("use_view_registry_prompt", True)),
             allowed_roles=vla_data.get("view_role_vocab", _DEFAULT_VIEW_ROLE_VOCAB),
             allowed_modalities=vla_data.get("view_modality_vocab", _DEFAULT_VIEW_MODALITY_VOCAB),
             cot_prompt=vla_data.get("CoT_prompt", "") if "CoT_prompt" in vla_data else None,
             cot_prompt_present=("CoT_prompt" in vla_data),
+            prompt_template=vla_data.get("prompt_template", "v1"),
         )
 
-    def build_qwenvl_inputs(self, images, instructions, solutions=None, **kwargs):
+    def build_qwenvl_inputs(
+        self, images, instructions, *, view_roles=None, view_modalities=None, profile_timing=False,
+    ):
         """
-        Build model inputs from raw data (images + instructions + optional solutions).
+        Build prefix model inputs from images and instructions.
         Follow official Qwen3-VL Instruct format: https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct
         """
 
-        profile_timing = bool(kwargs.get("profile_timing", False))
+        profile_timing = bool(profile_timing)
         self._last_input_timing = {}
         t0 = time.perf_counter() if profile_timing else None
 
@@ -356,13 +338,14 @@ class Qwen(nn.Module):
             self.processor,
             images,
             instructions,
-            solutions=solutions,
-            view_roles=kwargs.get("view_roles"),
-            view_modalities=kwargs.get("view_modalities"),
+            view_roles=view_roles,
+            view_modalities=view_modalities,
+            use_view_prompt=bool(vla_data.get("use_view_registry_prompt", True)),
             allowed_roles=vla_data.get("view_role_vocab", _DEFAULT_VIEW_ROLE_VOCAB),
             allowed_modalities=vla_data.get("view_modality_vocab", _DEFAULT_VIEW_MODALITY_VOCAB),
             cot_prompt=vla_data.get("CoT_prompt", "") if "CoT_prompt" in vla_data else None,
             cot_prompt_present=("CoT_prompt" in vla_data),
+            prompt_template=vla_data.get("prompt_template", "v1"),
         )
         t4 = time.perf_counter() if profile_timing else None
 

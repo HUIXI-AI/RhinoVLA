@@ -1,4 +1,4 @@
-"""Validation for the native72 training path."""
+"""Validation for the native continuous-action training paths."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch.distributed as dist
 from accelerate.logging import get_logger
 
 from rhinovla.dataloader import build_dataloader
-from rhinovla.dataloader.lerobot_native72 import RHINO72_DIM
+from rhinovla.dataloader.lerobot_native96 import RHINO96_DIM
 
 
 logger = get_logger(__name__)
@@ -21,13 +21,20 @@ def _warn(message: str) -> None:
         print(f"WARNING: {message}")
 
 
-def _validated_action_stats(profile, *, context: str) -> tuple[np.ndarray, np.ndarray]:
-    """Return one validated native72 action normalization profile."""
+def _expected_dim(vla_cfg) -> int:
+    dataset_py = str(vla_cfg.get("dataset_py", "lerobot_native96"))
+    if dataset_py != "lerobot_native96":
+        raise ValueError(f"V3 trainer requires dataset_py=lerobot_native96, got {dataset_py!r}")
+    return RHINO96_DIM
+
+
+def _validated_action_stats(profile, *, expected_dim: int, context: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return one validated action normalization profile."""
     action_mean = np.asarray(profile.get("action_mean", None), dtype=np.float32)
     action_std = np.asarray(profile.get("action_std", None), dtype=np.float32)
-    if action_mean.shape != (RHINO72_DIM,) or action_std.shape != (RHINO72_DIM,):
+    if action_mean.shape != (expected_dim,) or action_std.shape != (expected_dim,):
         raise ValueError(
-            f"{context} requires 72D action stats, got "
+            f"{context} requires {expected_dim}D action stats, got "
             f"mean={action_mean.shape} std={action_std.shape}"
         )
     if not np.isfinite(action_mean).all() or not np.isfinite(action_std).all():
@@ -38,12 +45,15 @@ def _validated_action_stats(profile, *, context: str) -> tuple[np.ndarray, np.nd
 
 
 def _resolve_batch_action_norm_stats(vla_cfg, examples) -> tuple[np.ndarray, np.ndarray]:
-    """Broadcast the one global 72D action normalization to a batch."""
-    action_mean, action_std = _validated_action_stats(vla_cfg, context="Native72 eval")
+    """Broadcast the one global action normalization to a batch."""
+    expected_dim = _expected_dim(vla_cfg)
+    action_mean, action_std = _validated_action_stats(
+        vla_cfg, expected_dim=expected_dim, context=f"{expected_dim}D eval"
+    )
     batch_size = len(examples)
     return (
-        np.broadcast_to(action_mean, (batch_size, RHINO72_DIM)).copy(),
-        np.broadcast_to(action_std, (batch_size, RHINO72_DIM)).copy(),
+        np.broadcast_to(action_mean, (batch_size, expected_dim)).copy(),
+        np.broadcast_to(action_std, (batch_size, expected_dim)).copy(),
     )
 
 
@@ -52,24 +62,38 @@ class _EvalMixin:
 
     def _init_val_dataloader(self):
         vla_cfg = self.config.datasets.vla_data
-        dataset_py = str(vla_cfg.get("dataset_py", "lerobot_native72"))
+        dataset_py = str(vla_cfg.get("dataset_py", "lerobot_native96"))
         self._val_dataloader = None
         self._val_iterator = None
 
-        if dataset_py != "lerobot_native72":
-            raise ValueError(f"Native72 trainer only supports lerobot_native72 eval, got {dataset_py}")
+        if dataset_py != "lerobot_native96":
+            raise ValueError(f"V3 trainer requires dataset_py=lerobot_native96, got {dataset_py}")
 
         try:
             val_loader = build_dataloader(self.config, dataset_py=dataset_py, split="val")
         except Exception as exc:  # noqa: BLE001
-            _warn(f"Native72 val dataloader init failed: {exc}; eval will be skipped.")
+            if vla_cfg.get("fixed_validation_loss", True):
+                raise
+            _warn(f"{dataset_py} val dataloader init failed: {exc}; eval will be skipped.")
             return
         if val_loader is None:
-            _warn("Native72 val split is not configured; eval will be skipped.")
+            _warn(f"{dataset_py} val split is not configured; eval will be skipped.")
             return
 
         self._val_dataloader = val_loader
-        logger.info(f"✅ Native72 val dataloader initialized: {len(val_loader.dataset)} samples")
+        if vla_cfg.get("fixed_validation_loss", True):
+            from torch.utils.data import DataLoader, Subset
+
+            rank, world = self.accelerator.process_index, self.accelerator.num_processes
+            subset = Subset(val_loader.dataset, list(range(rank, len(val_loader.dataset), world)))
+            self._val_dataloader = DataLoader(
+                subset,
+                batch_size=int(vla_cfg.get("eval_batch_size", 8)),
+                shuffle=False,
+                num_workers=2,
+                collate_fn=val_loader.collate_fn,
+            )
+        logger.info(f"✅ {dataset_py} val dataloader initialized: {len(val_loader.dataset)} samples")
 
     def eval_action_model(self, step_metrics: dict | None = None, use_ema: bool = False) -> dict:
         if step_metrics is None:
@@ -79,6 +103,9 @@ class _EvalMixin:
             return step_metrics
 
         vla_cfg = self.config.datasets.vla_data
+        if vla_cfg.get("fixed_validation_loss", True):
+            return self._fixed_validation_loss(step_metrics, use_ema=use_ema)
+        dataset_py = str(vla_cfg.get("dataset_py", "lerobot_native96"))
         n_eval_batches = int(vla_cfg.get("n_eval_batches", 4))
 
         metric_prefix = "ema_" if use_ema else ""
@@ -114,7 +141,7 @@ class _EvalMixin:
                     )
                     if pred_np.shape[0] != batch_action_mean.shape[0]:
                         raise ValueError(
-                            "native72 eval prediction batch does not match examples: "
+                            f"{dataset_py} eval prediction batch does not match examples: "
                             f"pred={pred_np.shape[0]} examples={batch_action_mean.shape[0]}"
                         )
                     pred_np = (
@@ -127,8 +154,12 @@ class _EvalMixin:
                         dtype=np.float32,
                     )
                     mask = np.asarray([ex["action_mask"] for ex in examples], dtype=np.float32)
-                    if gt.shape[-1] != RHINO72_DIM or mask.shape[-1] != RHINO72_DIM:
-                        raise ValueError(f"native72 eval expected 72D gt/mask, got gt={gt.shape} mask={mask.shape}")
+                    expected_dim = _expected_dim(vla_cfg)
+                    if gt.shape[-1] != expected_dim or mask.shape[-1] != expected_dim:
+                        raise ValueError(
+                            f"{dataset_py} eval expected {expected_dim}D gt/mask, "
+                            f"got gt={gt.shape} mask={mask.shape}"
+                        )
 
                     pred_batches.append(pred_np)
                     gt_batches.append(gt)
@@ -168,3 +199,37 @@ class _EvalMixin:
         )
         step_metrics[f"{metric_prefix}rhino/val_active_ratio"] = float(all_mask.mean())
         return step_metrics
+
+    def _fixed_validation_loss(self, step_metrics, use_ema=False):
+        """Evaluate the full held-out split with fixed noise and RTC draws."""
+        import random
+
+        raw_model = self.accelerator.unwrap_model(self.model)
+        was_training = raw_model.training
+        device = self.accelerator.device
+        totals = torch.zeros(3, dtype=torch.float64, device=device)
+        py_rng, np_rng = random.getstate(), np.random.get_state()
+        try:
+            raw_model.eval()
+            devices = [device.index] if device.type == "cuda" else []
+            with torch.random.fork_rng(devices=devices), torch.inference_mode():
+                seed = int(self.config.seed) + self.accelerator.process_index
+                torch.manual_seed(seed)
+                random.seed(seed)
+                np.random.seed(seed)
+                for examples in self._val_dataloader:
+                    with self.accelerator.autocast():
+                        out = raw_model(examples)
+                    totals[0] += out["fm/loss_numerator"].double()
+                    totals[1] += out["fm/loss_denominator"].double()
+                    totals[2] += len(examples)
+            if dist.is_initialized():
+                dist.all_reduce(totals)
+            prefix = "ema_" if use_ema else ""
+            step_metrics[f"{prefix}loss/val"] = (totals[0] / totals[1].clamp_min(1)).item()
+            step_metrics[f"{prefix}val/samples"] = totals[2].item()
+            return step_metrics
+        finally:
+            raw_model.train(was_training)
+            random.setstate(py_rng)
+            np.random.set_state(np_rng)

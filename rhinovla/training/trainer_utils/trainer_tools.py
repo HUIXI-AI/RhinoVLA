@@ -242,9 +242,8 @@ class TrainerUtils:
         """Adapt plain checkpoint keys to the target model.
 
         The release checkpoint is expected to be a merged, plain PyTorch state_dict.
-        The only compatibility kept here is `.base.` <-> plain Linear key
-        mapping, which is harmless for already-plain checkpoints and avoids
-        carrying unrelated instance-adapter code.
+        Remap pretrained module names and base Linear weights, excluding only
+        the known OAT and Action Expert instance-adapter tensors.
         """
         target_keys = set(target_state_dict.keys())
         adapted = {}
@@ -252,6 +251,8 @@ class TrainerUtils:
             "plain_to_base": 0,
             "base_to_plain": 0,
             "legacy_module_key": 0,
+            "ignored_oat_pretraining_extra": 0,
+            "ignored_instance_lora_pretraining_extra": 0,
             "dropped_unexpected": 0,
         }
 
@@ -272,6 +273,19 @@ class TrainerUtils:
 
             if key in target_keys:
                 adapted[key] = value
+                continue
+
+            # The V3 pretraining artifact also stores its OAT and instance-LoRA
+            # branches. Continuous fine-tuning has no such modules; keep the
+            # remaining load strict and ignore only these named branches.
+            if key.startswith("oat_target_encoder.") or key.startswith("oat_adapter."):
+                stats["ignored_oat_pretraining_extra"] += 1
+                continue
+            if re.fullmatch(
+                r"action_expert\.transformer\.layers\.\d+\.mlp\."
+                r"(?:gate_proj|up_proj|down_proj)\.(?:lora_a|lora_b|instance_to_slot)", key
+            ):
+                stats["ignored_instance_lora_pretraining_extra"] += 1
                 continue
 
             if ".base." in key:
@@ -367,6 +381,13 @@ class TrainerUtils:
             print(f"✅ remapped {adapt_stats['base_to_plain']} .base.* params into plain Linear weights")
         if adapt_stats.get("legacy_module_key"):
             print(f"✅ remapped {adapt_stats['legacy_module_key']} legacy module keys to RhinoVLA keys")
+        ignored_oat = int(adapt_stats.get("ignored_oat_pretraining_extra", 0) or 0)
+        ignored_lora = int(adapt_stats.get("ignored_instance_lora_pretraining_extra", 0) or 0)
+        if ignored_oat or ignored_lora:
+            print(
+                "✅ ignored known V3 pretraining-only tensors: "
+                f"oat={ignored_oat}, instance_lora={ignored_lora}"
+            )
 
     @staticmethod
     def print_freeze_status(model):

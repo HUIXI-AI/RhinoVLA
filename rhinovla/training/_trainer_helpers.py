@@ -163,15 +163,15 @@ def _mask_fingers(mask: np.ndarray, base: int) -> str:
     )
 
 
-def _format_72d_mask_lines(mask_row: Any) -> tuple[str, str, str, str, str]:
-    """Format RhinoVLA 72D mask by semantic groups for GIF footers."""
+def _format_96d_mask_lines(mask_row: Any) -> tuple[str, str, str, str, str]:
+    """Format V3 action masks by semantic groups for GIF footers."""
     mask = np.asarray(mask_row, dtype=np.float32).reshape(-1)
     return (
         f"Arm    L[{_mask_segment(mask, 0, 7)}] R[{_mask_segment(mask, 7, 14)}] Grip[{_mask_segment(mask, 14, 16)}]",
         f"Hand L {_mask_fingers(mask, 16)}",
         f"Hand R {_mask_fingers(mask, 32)}",
         f"Body   Head[{_mask_segment(mask, 48, 51)}] Torso[{_mask_segment(mask, 51, 53)}] Leg[{_mask_segment(mask, 53, 55)}] Waist[{_mask_segment(mask, 55, 58)}]",
-        f"Base   Vel[{_mask_segment(mask, 58, 61)}] Reserved[{_mask_segment(mask, 61, 72)}]",
+        f"V3     EEF[{_mask_segment(mask, 61, 73)}] Legs[{_mask_segment(mask, 73, 85)}] Reserved[{_mask_segment(mask, 85, 96)}]",
     )
 
 
@@ -359,7 +359,7 @@ def _apply_data_phase(cfg, phase: dict[str, Any] | None) -> None:
 
 
 def _auto_parallel_index_build(cfg) -> None:
-    """No-op in the native72 path."""
+    """No-op in the native96 path."""
     return
 
 
@@ -449,7 +449,7 @@ __all__ = [
     "_short_text",
     "_mask_segment",
     "_mask_fingers",
-    "_format_72d_mask_lines",
+    "_format_96d_mask_lines",
     "_resize_down_keep_aspect",
     "_render_sample_footer_frame",
     "build_accelerator",

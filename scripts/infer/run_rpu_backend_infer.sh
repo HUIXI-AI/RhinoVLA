@@ -11,7 +11,7 @@
 #   IMAGES='/path/head.png /path/left.png /path/right.png'
 #
 # Optional:
-#   MAPPING=/path/to/native72_mapping.yaml
+#   MAPPING=/path/to/native96_mapping.yaml
 #   MAPPING_DATASET_ID=dataset_id
 #   RPU_ENV_FILE=/path/to/rhinovla_runtime_env.toml
 #   RPU_ENV='KEY=VALUE KEY2=VALUE2'

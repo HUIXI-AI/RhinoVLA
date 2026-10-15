@@ -2,9 +2,11 @@
 """Compute RhinoVLA-compatible LeRobot v3 normalization stats.
 
 The output keeps legacy absolute `action_mean/std` fields and always writes
-72D absolute and delta-from-current-state action spaces for native72 mappings.
+96D absolute and delta-from-current-state action spaces for native96 mappings.
 `absolute_action_slots` only defines delta-space exceptions such as scalar
 gripper opening; it never controls whether the two spaces are generated.
+Tail windows repeat the last valid action by default, matching the dataloader;
+use --no-pad-episode-end when training with pad_episode_end=false.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ DEFAULT_SAFE_HALF_RANGE_THRESHOLD = 0.01
 DEFAULT_NORMALIZED_RANGE_WARNING = 2.0
 DEFAULT_ZERO_CENTER_BALANCE_TOLERANCE = 0.15
 DEFAULT_ZERO_CENTER_MEAN_OFFSET_FRACTION = 0.20
-RHINO72_DIM = 72
+RHINO96_DIM = 96
 COMMAND_NAME_HINTS = ("velocity", "vel", "cmd", "command", "control")
 METHOD = (
     "quantile-minmax-as-affine (NO clip): "
@@ -659,16 +661,26 @@ def _base_episode_chunk_mask(
     return mask
 
 
-def _valid_chunk_start_indices(
+def _valid_action_chunk_indices(
     *,
     dataset_root: Path,
     files: list[Path],
     mapping: dict[str, Any],
     action_horizon: int,
+    pad_episode_end: bool = True,
 ) -> np.ndarray:
+    if action_horizon < 1:
+        raise ValueError(f"action_horizon must be positive, got {action_horizon}")
     episode_indices = _read_scalar_column(files, "episode_index", np.int64)
     frame_indices = _read_scalar_column(files, "frame_index", np.int64)
-    valid_mask = _base_episode_chunk_mask(episode_indices, frame_indices, action_horizon)
+    episode_starts = np.r_[0, np.flatnonzero(episode_indices[1:] != episode_indices[:-1]) + 1]
+    episode_ends = np.r_[episode_starts[1:], len(episode_indices)]
+    last_indices = np.repeat(episode_ends - 1, episode_ends - episode_starts)
+    valid_mask = (
+        np.ones(len(episode_indices), dtype=bool)
+        if pad_episode_end
+        else _base_episode_chunk_mask(episode_indices, frame_indices, action_horizon)
+    )
     sampling = dict(mapping.get("sampling", {}) or {})
     mode = str(sampling.get("valid_chunk_filter", "episode_only") or "episode_only").lower()
 
@@ -699,8 +711,13 @@ def _valid_chunk_start_indices(
             episode_rows = np.nonzero(episode_indices == episode)[0]
             frames = frame_indices[episode_rows]
             for start, end in merged:
-                keep = (frames >= start) & ((frames + action_horizon) <= end)
+                keep = (frames >= start) & (
+                    (frames < end) if pad_episode_end else ((frames + action_horizon) <= end)
+                )
                 interval_mask[episode_rows[keep]] = True
+                # Repeat the interval's last action, never a later invalid frame.
+                rows = episode_rows[keep]
+                last_indices[rows] = np.minimum(last_indices[rows], rows + end - frames[keep] - 1)
         valid_mask &= interval_mask
     elif mode != "episode_only":
         raise ValueError(
@@ -711,20 +728,23 @@ def _valid_chunk_start_indices(
     starts = np.nonzero(valid_mask)[0]
     if starts.size == 0:
         raise ValueError(f"no valid {action_horizon}-step chunk starts for combined delta norm")
-    return starts
+    return np.minimum(
+        starts[:, None] + np.arange(action_horizon, dtype=np.int64)[None, :],
+        last_indices[starts, None],
+    )
 
 
-def _scatter_active_stats_to_rhino72(
+def _scatter_active_stats_to_rhino96(
     *,
     active_slots: list[int],
     mean: np.ndarray,
     std: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    mean72 = np.zeros(RHINO72_DIM, dtype=np.float32)
-    std72 = np.ones(RHINO72_DIM, dtype=np.float32)
-    mean72[active_slots] = np.asarray(mean, dtype=np.float32)
-    std72[active_slots] = np.asarray(std, dtype=np.float32)
-    return mean72, std72
+    mean96 = np.zeros(RHINO96_DIM, dtype=np.float32)
+    std96 = np.ones(RHINO96_DIM, dtype=np.float32)
+    mean96[active_slots] = np.asarray(mean, dtype=np.float32)
+    std96[active_slots] = np.asarray(std, dtype=np.float32)
+    return mean96, std96
 
 
 def _compute_combined_action_stats(
@@ -737,6 +757,7 @@ def _compute_combined_action_stats(
     absolute_source_mean: np.ndarray,
     absolute_source_std: np.ndarray,
     safe_half_range_threshold: float,
+    pad_episode_end: bool = True,
 ) -> dict[str, Any]:
     spec = _combined_action_mapping_spec(mapping)
     active_slots = spec["active_action_slots"]
@@ -757,20 +778,21 @@ def _compute_combined_action_stats(
         [absolute_source_std[source_index] for source_index in action_source_indices],
         dtype=np.float32,
     )
-    abs_mean72, abs_std72 = _scatter_active_stats_to_rhino72(
+    abs_mean96, abs_std96 = _scatter_active_stats_to_rhino96(
         active_slots=active_slots,
         mean=abs_mean_active,
         std=abs_std_active,
     )
 
     action_horizon = int(mapping.get("action_horizon", 30))
-    starts = _valid_chunk_start_indices(
+    chunk_indices = _valid_action_chunk_indices(
         dataset_root=dataset_root,
         files=files,
         mapping=mapping,
         action_horizon=action_horizon,
+        pad_episode_end=pad_episode_end,
     )
-    chunk_indices = starts[:, None] + np.arange(action_horizon, dtype=np.int64)[None, :]
+    starts = chunk_indices[:, 0]
     action_delta_values = action_active[chunk_indices].copy()
     action_position_by_slot = {slot: position for position, slot in enumerate(active_slots)}
     for slot in spec["delta_from_state_slots"]:
@@ -786,16 +808,16 @@ def _compute_combined_action_stats(
         flat_delta_values,
         safe_half_range_threshold,
     )
-    delta_mean72, delta_std72 = _scatter_active_stats_to_rhino72(
+    delta_mean96, delta_std96 = _scatter_active_stats_to_rhino96(
         active_slots=active_slots,
         mean=delta_mean_active,
         std=delta_std_active,
     )
     return {
-        "action_abs_mean": abs_mean72,
-        "action_abs_std": abs_std72,
-        "action_delta_mean": delta_mean72,
-        "action_delta_std": delta_std72,
+        "action_abs_mean": abs_mean96,
+        "action_abs_std": abs_std96,
+        "action_delta_mean": delta_mean96,
+        "action_delta_std": delta_std96,
         "absolute_action_slots": spec["absolute_action_slots"],
         "delta_from_state_slots": spec["delta_from_state_slots"],
         "passthrough_action_slots": spec["passthrough_action_slots"],
@@ -823,6 +845,7 @@ def compute_norm_stats(
     target_dim: int | None = None,
     safe_half_range_threshold: float = DEFAULT_SAFE_HALF_RANGE_THRESHOLD,
     fail_on_norm_warning: bool = False,
+    pad_episode_end: bool = True,
 ) -> dict[str, Any]:
     dataset_root = Path(dataset_root)
     mapping = Path(mapping_path) if mapping_path is not None else None
@@ -857,6 +880,7 @@ def compute_norm_stats(
             absolute_source_mean=stats_arrays["action_mean"],
             absolute_source_std=stats_arrays["action_std"],
             safe_half_range_threshold=safe_half_range_threshold,
+            pad_episode_end=pad_episode_end,
         )
     norm_diagnostics = _build_norm_diagnostics(
         state_values=states,
@@ -910,6 +934,7 @@ def compute_norm_stats(
                 "valid_chunk_starts": combined_action_stats["valid_chunk_starts"],
                 "delta_action_values": combined_action_stats["delta_action_values"],
                 "action_horizon": combined_action_stats["action_horizon"],
+                "pad_episode_end": bool(pad_episode_end),
                 "action_spaces": {
                     "absolute_joint_position": {
                         "mean_key": "action_abs_mean",
@@ -944,6 +969,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--action-key", default=None, help=f"Override action column, default {DEFAULT_ACTION_KEY}")
     parser.add_argument("--target-dim", type=int, default=None, help=f"Override target dim, default {DEFAULT_TARGET_DIM}")
     parser.add_argument(
+        "--pad-episode-end",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Repeat the last valid action at episode/interval tails; match the dataloader setting",
+    )
+    parser.add_argument(
         "--safe-half-range-threshold",
         type=float,
         default=DEFAULT_SAFE_HALF_RANGE_THRESHOLD,
@@ -976,6 +1007,7 @@ def main() -> None:
         target_dim=args.target_dim,
         safe_half_range_threshold=args.safe_half_range_threshold,
         fail_on_norm_warning=args.fail_on_norm_warning,
+        pad_episode_end=args.pad_episode_end,
     )
     path = write_norm_json(stats, output, overwrite=args.overwrite)
     for warning in stats["_meta"]["norm_diagnostics"]["warnings"]:

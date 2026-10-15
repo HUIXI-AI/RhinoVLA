@@ -11,6 +11,7 @@ dist/
 
 # Virtual environments
 .venv/
+.venvs/
 venv/
 env/
 .env
@@ -19,6 +20,7 @@ env/
 # Models, datasets, checkpoints and large artifacts
 models/
 checkpoints/
+hf_release/
 
 /datasets/*
 !/datasets/compute_norm_json.py

@@ -1,8 +1,11 @@
 # 数据准备指南
 
-本文说明如何把一个 LeRobot v3 数据集接入 RhinoVLA native72 微调入口。核心流程是编写一份
-native72 mapping,把数据集原生 `observation.state` 和 `action` 显式映射到 RhinoVLA 固定的
-72D state/action 槽位,再生成训练配置中引用的 `meta/norm.json`。
+本文说明如何把一个 LeRobot v3 数据集接入 RhinoVLA V3 微调入口。核心流程是编写一份
+native96 mapping，把数据集原生 `observation.state` 和 `action` 显式映射到 RhinoVLA 固定的
+96D state/action 槽位，再生成训练配置中引用的 `meta/norm.json`。
+
+本分支仅支持 V3；V2 已冻结，V2 权重不能在此分支加载。LeRobot v3 是数据格式版本，
+与 RhinoVLA 的模型版本不是同一概念。
 
 训练启动、checkpoint 和日志说明见 [FINETUNING_GUIDE.md](FINETUNING_GUIDE.md)。
 
@@ -11,14 +14,15 @@ native72 mapping,把数据集原生 `observation.state` 和 `action` 显式映�
 ## 0. 需要准备的文件
 
 1. 一个 LeRobot v3 磁盘数据集,包含 `data/`、`videos/` 和 `meta/`。
-2. 一份 native72 mapping:`configs/data_mappings/<robot>.yaml`。
+2. 一份 native96 mapping：`configs/data_mappings/<robot>.yaml`。
 3. 一份归一化统计:`<dataset_root>/meta/norm.json`,由 `datasets/compute_norm_json.py` 生成。
 4. 一份训练配置,在 `datasets.vla_data` 中引用 mapping 和 norm。
 
 仓库自带的最小示例是:
 
 ```text
-configs/data_mappings/demo_lerobot_native72.yaml
+configs/data_mappings/demo_lerobot_native96.yaml
+configs/training/demo_ae_finetune.yaml
 configs/training/demo_full_finetune.yaml
 ```
 
@@ -58,11 +62,18 @@ datasets/<your_lerobot_v3>/
 | `valid_chunk_start` | parquet 中有 `valid_chunk_start` 布尔列 | 数据转换阶段已标注有效起点 |
 | `valid_intervals` | `meta/episode_valid_intervals.parquet` | 需要按人工/规则区间过滤有效片段 |
 
+训练配置的 `datasets.vla_data.pad_episode_end` 默认为 `true`：在 episode 或有效区间末尾，
+不足一个 action horizon 的窗口重复最后有效动作补齐，补齐位置保留 action 监督，不读取下一 episode 的动作。
+设为 `false` 可关闭补齐，`episode_only` / `valid_intervals` 仅选择完整窗口；
+`valid_chunk_start` 使用数据侧标记，关闭补齐时必须确保标记只选择完整窗口。
+`compute_norm_json.py` 同样默认补齐尾窗口；训练关闭补齐时，生成 norm 要加
+`--no-pad-episode-end`，确保 delta 动作统计使用相同的窗口。
+
 ---
 
-## 2. 72D 槽位契约
+## 2. 96D 槽位契约
 
-RhinoVLA 固定使用 72D state/action。未映射的槽位填 0,mask 填 0,不参与 action loss。
+RhinoVLA 固定使用 96D state/action。未映射的槽位填 0,mask 填 0,不参与 action loss。
 
 | 槽位 | 语义 |
 |---|---|
@@ -75,19 +86,21 @@ RhinoVLA 固定使用 72D state/action。未映射的槽位填 0,mask 填 0,不�
 | `53..54` | 折叠升降腿关节 |
 | `55..57` | 腰部 roll/pitch/yaw |
 | `58..60` | 移动底盘速度指令 vx/vy/yaw_rate |
-| `61..71` | 保留 |
+| `61..72` | EEF0/EEF1 位姿 |
+| `73..84` | 左右腿关节 |
+| `85..95` | 保留 |
 
-mapping 只负责“源向量下标到 72D 槽位”的机械映射,不推断机器人语义。
+mapping 只负责“源向量下标到 96D 槽位”的机械映射,不推断机器人语义。
 
 ---
 
-## 3. 编写 native72 mapping
+## 3. 编写 native96 mapping
 
 示例骨架:
 
 ```yaml
 format: lerobot
-target_dim: 72
+target_dim: 96
 fps: 30
 action_horizon: 30
 image_size: [256, 256]
@@ -126,8 +139,8 @@ datasets:
 核心规则:
 
 ```text
-rhino72_state[target_slots[i]]  = observation.state[state_source_indices[i]]
-rhino72_action[target_slots[i]] = action[action_source_indices[i]]
+rhino96_state[target_slots[i]]  = observation.state[state_source_indices[i]]
+rhino96_action[target_slots[i]] = action[action_source_indices[i]]
 ```
 
 注意事项:
@@ -158,7 +171,7 @@ std  = (p99 - p01) / 2
 std < 0.01 的维度使用 1.0
 ```
 
-对 native72 mapping，脚本默认每次都生成两套 72D action 统计：
+对 native96 mapping，脚本默认每次都生成两套 96D action 统计：
 
 - `action_abs_mean/std`：原始绝对动作空间。
 - `action_delta_mean/std`：除 `absolute_action_slots` 外，未来 chunk 中每个动作都减去 chunk 起点的 current state。

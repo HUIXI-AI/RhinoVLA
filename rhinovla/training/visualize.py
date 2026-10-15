@@ -1,4 +1,4 @@
-"""Native72 visual logging.
+"""Native96 visual logging.
 
 The training path is intentionally narrow: VLM prompt cards, teacher-forcing
 error figures, and action-expert attention figures generated from actual model
@@ -7,6 +7,7 @@ inputs.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import math
 import os
 import textwrap
@@ -34,7 +35,9 @@ except ImportError:  # pragma: no cover - exercised on hosts without swanlab
 logger = get_logger(__name__)
 _RESAMPLE_BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
 _RESAMPLE_BICUBIC = getattr(Image, "Resampling", Image).BICUBIC
+_RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 _PARENTHETICAL_TITLE_RE = re.compile(r"\s*\([^)]*\)")
+_SWANLAB_IMAGE_MAX_SIDE = 1280
 ATTENTION_HEATMAP_ALPHA_MAX = 0.48
 ATTENTION_HEATMAP_LIGHTEN = 0.16
 
@@ -126,46 +129,21 @@ def split_qwen_image_token_attention(
     return heatmaps
 
 
-def _patched_sdpa_factory(captured: list[torch.Tensor]):
-    def patched_sdpa(
-        query,
-        key,
-        value,
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=None,
-        enable_gqa=False,
-        **kwargs,
-    ):
-        head_dim = query.shape[-1]
-        attn_scale = scale if scale is not None else (1.0 / math.sqrt(float(head_dim)))
-        if query.shape[1] != key.shape[1]:
-            if query.shape[1] % key.shape[1] != 0:
-                raise ValueError(f"GQA mismatch: q heads {query.shape[1]} % k heads {key.shape[1]} != 0")
-            repeat = query.shape[1] // key.shape[1]
-            key = key.repeat_interleave(repeat, dim=1)
-            value = value.repeat_interleave(repeat, dim=1)
-
-        scores = (query @ key.transpose(-2, -1)) * attn_scale
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(~attn_mask, float("-inf"))
-            else:
-                scores = scores + attn_mask
-        if is_causal:
-            q_len, k_len = query.shape[-2], key.shape[-2]
-            causal = torch.ones((q_len, k_len), dtype=torch.bool, device=query.device).tril(
-                diagonal=k_len - q_len
-            )
-            scores = scores.masked_fill(~causal, float("-inf"))
-        weights = scores.softmax(dim=-1)
-        if dropout_p > 0:
-            weights = F.dropout(weights, p=dropout_p)
-        captured.append(weights.detach())
-        return weights @ value
-
-    return patched_sdpa
+@contextmanager
+def _capture_action_expert_attention(raw_model):
+    """Capture only Action Expert attention without replacing global SDPA."""
+    attentions = [layer.self_attn for layer in raw_model.action_expert.layers]
+    if not attentions:
+        raise RuntimeError("action expert has no attention layers")
+    captured: list[torch.Tensor] = []
+    previous = [attn._attention_capture for attn in attentions]
+    for attn in attentions:
+        attn._attention_capture = captured
+    try:
+        yield captured
+    finally:
+        for attn, old_capture in zip(attentions, previous):
+            attn._attention_capture = old_capture
 
 
 def _mean_prefix_token_attention(captured: list[torch.Tensor], prefix_len: int) -> np.ndarray:
@@ -356,7 +334,7 @@ def _overlay_heatmap(image: Image.Image, heatmap: np.ndarray, alpha: float = 0.5
 
 _CAM_DISPLAY_ORDER = ("left", "head", "right")
 _CAM_TITLE = {"head": "head", "left": "hand_left", "right": "hand_right"}
-_RHINO72_DIM_LABELS = {
+_RHINO96_DIM_LABELS = {
     **{i: f"left_arm_{i}" for i in range(7)},
     **{7 + i: f"right_arm_{i}" for i in range(7)},
     14: "left_gripper",
@@ -384,8 +362,20 @@ _RHINO72_DIM_LABELS = {
     58: "base_vx",
     59: "base_vy",
     60: "base_wz",
-    **{61 + i: f"reserved_{i}" for i in range(11)},
+    **{61 + i: f"eef0_translation_{i}" for i in range(3)},
+    **{64 + i: f"eef0_rotation_{i}" for i in range(3)},
+    **{67 + i: f"eef1_translation_{i}" for i in range(3)},
+    **{70 + i: f"eef1_rotation_{i}" for i in range(3)},
+    **{73 + i: f"left_leg_{i}" for i in range(6)},
+    **{79 + i: f"right_leg_{i}" for i in range(6)},
+    **{85 + i: f"reserved_{i}" for i in range(11)},
 }
+
+
+def _dimension_labels(action_dim: int) -> dict[int, str]:
+    if int(action_dim) != 96:
+        raise ValueError(f"RhinoVLA V3 visualization expects 96 action dimensions, got {action_dim}")
+    return _RHINO96_DIM_LABELS
 
 
 def _tf_error_active_slots_and_labels(mask: np.ndarray, *, action_dim: int) -> tuple[list[int], list[str]]:
@@ -396,7 +386,8 @@ def _tf_error_active_slots_and_labels(mask: np.ndarray, *, action_dim: int) -> t
     active = np.flatnonzero(mask_np > 0.5).astype(int).tolist()
     if not active:
         active = list(range(int(action_dim)))
-    labels = [_RHINO72_DIM_LABELS.get(int(slot), f"slot_{int(slot)}") for slot in active]
+    label_map = _dimension_labels(action_dim)
+    labels = [label_map.get(int(slot), f"slot_{int(slot)}") for slot in active]
     return active, labels
 
 
@@ -749,6 +740,17 @@ def _fit_image(image: Image.Image, size: tuple[int, int], fill: tuple[int, int, 
     return canvas
 
 
+def _swanlab_image_path(path: Path) -> Path:
+    """Keep the full local figure but upload a browser-friendly JPEG preview."""
+
+    with Image.open(path) as image:
+        preview = image.convert("RGB")
+    preview.thumbnail((_SWANLAB_IMAGE_MAX_SIDE, _SWANLAB_IMAGE_MAX_SIDE), _RESAMPLE_LANCZOS)
+    preview_path = path.with_name(f"{path.stem}_swanlab.jpg")
+    preview.save(preview_path, format="JPEG", quality=85)
+    return preview_path
+
+
 def build_action_expert_attention_panel(
     *,
     model_images: list[Any] | None = None,
@@ -757,7 +759,7 @@ def build_action_expert_attention_panel(
     heatmaps: list[np.ndarray],
     labels: list[str] | None = None,
     tag: str = "RhinoVLA",
-    run_id: str = "native72",
+    run_id: str = "native96",
     step: int | str = 0,
     framework: str = "RhinoVLA",
     ckpt_path: str = "",
@@ -953,9 +955,14 @@ def build_tf_error_episode_panel(
     if frame_np.shape[0] != gt_np.shape[0]:
         raise ValueError(f"frame_ids length {frame_np.shape[0]} != gt_action rows {gt_np.shape[0]}")
     num_dims = int(gt_np.shape[1])
-    labels = list(dim_labels or [_RHINO72_DIM_LABELS.get(i, f"slot_{i}") for i in range(num_dims)])
-    if len(labels) < num_dims:
-        labels += [_RHINO72_DIM_LABELS.get(i, f"slot_{i}") for i in range(len(labels), num_dims)]
+    # Episode callers pass only active slots and their canonical labels.
+    if dim_labels is not None:
+        labels = list(dim_labels)
+        if len(labels) != num_dims:
+            raise ValueError(f"dim_labels length {len(labels)} != plotted dimensions {num_dims}")
+    else:
+        label_map = _dimension_labels(num_dims)
+        labels = [label_map.get(i, f"slot_{i}") for i in range(num_dims)]
     bounds = list(bounds or [])
 
     palette = plt.cm.tab10.colors
@@ -967,15 +974,19 @@ def build_tf_error_episode_panel(
         ax = axes[dim]
         color = palette[dim % len(palette)]
         ax.plot(frame_np, gt_np[:, dim], color=color, alpha=0.40, linewidth=2.0, label="GT action")
+        covered = np.zeros(num_frames, dtype=bool)
         for t0, segment in pred_segments:
             seg = np.asarray(segment, dtype=np.float32)
             if seg.ndim != 2 or dim >= seg.shape[1]:
                 continue
             local_ts = np.arange(int(t0), int(t0) + len(seg))
-            mask = local_ts < num_frames
+            mask = (local_ts >= 0) & (local_ts < num_frames)
+            mask[mask] &= ~covered[local_ts[mask]]
             if not np.any(mask):
                 continue
-            ax.plot(frame_np[local_ts[mask]], seg[: int(mask.sum()), dim], color=color, alpha=1.0, linewidth=1.0)
+            # Keep the first prediction where the terminal chunk overlaps.
+            ax.plot(frame_np[local_ts[mask]], seg[mask, dim], color=color, alpha=1.0, linewidth=1.0)
+            covered[local_ts[mask]] = True
             ax.axvline(int(frame_np[int(t0)]), color="gray", alpha=0.15, linewidth=0.5)
             ax.scatter(
                 [int(frame_np[int(t0)])],
@@ -1042,7 +1053,7 @@ def build_tf_error_episode_panel(
 
 
 class _VizMixin:
-    """Native72 visual diagnostics for VLATrainer."""
+    """V3 visual diagnostics for VLATrainer."""
 
     def _visual_dir(self) -> Path:
         path = Path(self.config.output_dir) / "visualizations"
@@ -1158,7 +1169,7 @@ class _VizMixin:
         )
 
     def _run_id_for_viz(self) -> str:
-        return str(getattr(self.config, "run_id", "native72"))
+        return str(getattr(self.config, "run_id", "native96"))
 
     def _ckpt_path_for_viz(self) -> str:
         try:
@@ -1205,7 +1216,10 @@ class _VizMixin:
         if not (HAS_SWANLAB and self._swanlab_enabled):
             return
         try:
-            swanlab.log({key: swanlab.Image(str(path))}, step=step)
+            swanlab.log(
+                {key: swanlab.Image(str(_swanlab_image_path(path)), file_type="jpeg")},
+                step=step,
+            )
         except Exception as exc:  # noqa: BLE001
             failures = int(getattr(self, "_swanlab_image_log_failures", 0)) + 1
             self._swanlab_image_log_failures = failures
@@ -1457,7 +1471,7 @@ class _VizMixin:
                     )
                     panel.save(out_path)
                     self._log_swanlab_image(
-                        _indexed_viz_key("tf_error/native72", sample_idx, total),
+                        _indexed_viz_key("tf_error/native96", sample_idx, total),
                         out_path,
                         step=self._swanlab_step(),
                     )
@@ -1495,15 +1509,10 @@ class _VizMixin:
                     input_ids = qwen_inputs["input_ids"][0].detach().cpu().numpy()
                     grid = qwen_inputs["image_grid_thw"].detach().cpu().numpy()
 
-                    captured: list[torch.Tensor] = []
-                    original_sdpa = F.scaled_dot_product_attention
-                    F.scaled_dot_product_attention = _patched_sdpa_factory(captured)
-                    try:
+                    with _capture_action_expert_attention(raw_model) as captured:
                         torch.manual_seed(0)
                         with torch.no_grad():
                             raw_model.predict_action([sample], num_steps=1)
-                    finally:
-                        F.scaled_dot_product_attention = original_sdpa
 
                     token_weights = _mean_prefix_token_attention(captured, prefix_len=len(input_ids))
                     heatmaps = split_qwen_image_token_attention(

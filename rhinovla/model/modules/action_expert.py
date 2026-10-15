@@ -84,8 +84,8 @@ def bool_mask_to_attention_bias(mask: Tensor, dtype: torch.dtype) -> Tensor:
 class RhinoActionExpertConfig:
     """Rhino action expert config aligned to Qwen3-VL attention/cache shape."""
 
-    action_dim: int = 72
-    state_dim: int = 72
+    action_dim: int = 96
+    state_dim: int = 96
     action_horizon: int = 30
     width: int = 1024
     depth: int = 10
@@ -102,13 +102,17 @@ class RhinoActionExpertConfig:
     use_adarms: bool = True
     use_mask_condition: bool = False
 
+    def __post_init__(self):
+        if self.use_adarms is not True:
+            raise ValueError("RhinoVLA V3 requires use_adarms=true: AdaRMS is the only timestep conditioning path")
+
     @classmethod
     def from_qwen_text_config(
         cls,
         qwen_text_config: Qwen3VLTextConfig,
         *,
         action_dim: int,
-        state_dim: int = 72,
+        state_dim: int = 96,
         action_horizon: int = 30,
         width: int = 1024,
         depth: int = 10,
@@ -215,6 +219,7 @@ class RhinoActionAttention(nn.Module):
         self.o_proj = nn.Linear(self.q_dim, config.width, bias=config.attention_bias)
         self.q_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self._attention_capture: list[Tensor] | None = None
 
     def forward(
         self,
@@ -241,14 +246,22 @@ class RhinoActionAttention(nn.Module):
         v = _repeat_kv(v, self.num_key_value_groups)
 
         attn_bias = bool_mask_to_attention_bias(attention_mask, q.dtype)
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_bias,
-            dropout_p=self.config.attention_dropout if self.training else 0.0,
-            scale=self.scaling,
-        )
+        if self._attention_capture is None:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_bias,
+                dropout_p=self.config.attention_dropout if self.training else 0.0,
+                scale=self.scaling,
+            )
+        else:
+            # Only visualization captures weights; training keeps native SDPA.
+            if self.training:
+                raise RuntimeError("attention capture requires eval mode")
+            weights = ((q @ k.transpose(-2, -1)) * self.scaling + attn_bias).softmax(dim=-1)
+            self._attention_capture.append(weights.detach())
+            out = weights @ v
         out = out.transpose(1, 2).reshape(bsz, suffix_len, self.q_dim)
         return self.o_proj(out)
 
@@ -256,7 +269,7 @@ class RhinoActionAttention(nn.Module):
 class RhinoActionLayer(nn.Module):
     def __init__(self, config: RhinoActionExpertConfig):
         super().__init__()
-        cond_dim = config.width if config.use_adarms else None
+        cond_dim = config.width
         self.input_layernorm = AdaRMSNorm(config.width, eps=config.rms_norm_eps, cond_dim=cond_dim)
         self.self_attn = RhinoActionAttention(config)
         self.post_attention_layernorm = AdaRMSNorm(config.width, eps=config.rms_norm_eps, cond_dim=cond_dim)
@@ -296,7 +309,7 @@ class _RhinoActionTransformer(nn.Module):
         self.config = config
         self.qwen_rotary_emb = qwen_rotary_emb
         self.layers = nn.ModuleList([RhinoActionLayer(config) for _ in range(config.depth)])
-        self.norm = AdaRMSNorm(config.width, eps=config.rms_norm_eps, cond_dim=config.width if config.use_adarms else None)
+        self.norm = AdaRMSNorm(config.width, eps=config.rms_norm_eps, cond_dim=config.width)
 
     def forward(
         self,
@@ -347,15 +360,12 @@ class RhinoActionIO(nn.Module):
         self.config = config
         self.action_in_proj = nn.Linear(config.action_dim, config.width)
         self.action_out_proj = nn.Linear(config.width, config.action_dim)
-        self.action_time_mlp_in = nn.Linear(config.width * 2, config.width)
-        self.action_time_mlp_out = nn.Linear(config.width, config.width)
         self.state_proj = nn.Linear(config.state_dim, config.width) if config.use_state_token and config.state_dim > 0 else None
 
     def embed_suffix(self, state: Tensor | None, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         action_embeds = self.action_in_proj(noisy_actions)
-        time_emb = create_sinusoidal_pos_embedding(timestep, self.config.width).to(action_embeds.device, action_embeds.dtype)
+        time_emb = create_sinusoidal_pos_embedding(timestep, self.config.width)
         if time_emb.ndim == 2:
-            per_action_time = time_emb[:, None, :].expand_as(action_embeds)
             adarms_cond = time_emb
         else:
             if time_emb.shape[:2] != action_embeds.shape[:2]:
@@ -363,10 +373,8 @@ class RhinoActionIO(nn.Module):
                     f"per-token timestep shape {tuple(time_emb.shape[:2])} does not match actions "
                     f"{tuple(action_embeds.shape[:2])}"
                 )
-            per_action_time = time_emb
             adarms_cond = time_emb
-        action_time_embeds = torch.cat([action_embeds, per_action_time], dim=-1)
-        action_time_embeds = self.action_time_mlp_out(F.silu(self.action_time_mlp_in(action_time_embeds)))
+        action_time_embeds = action_embeds
 
         tokens = []
         masks = []
@@ -381,6 +389,7 @@ class RhinoActionIO(nn.Module):
         if adarms_cond.ndim == 3 and self.state_proj is not None:
             state_time_cond = adarms_cond.mean(dim=1, keepdim=True)
             adarms_cond = torch.cat([state_time_cond, adarms_cond], dim=1)
+        adarms_cond = adarms_cond.to(action_embeds.device, action_embeds.dtype)
         return torch.cat(tokens, dim=1), torch.cat(masks, dim=1), adarms_cond
 
     def decode_actions(self, suffix_hidden: Tensor) -> Tensor:
@@ -391,27 +400,28 @@ class RhinoActionIO(nn.Module):
 def build_suffix_position_ids(
     prefix_mask: Tensor,
     suffix_mask: Tensor,
-    prefix_rope_deltas: Tensor,
+    prefix_rope_deltas: Tensor | None = None,
 ) -> Tensor:
-    """Build AE suffix mRoPE ids from Qwen3-VL's continuation delta."""
+    """Build AE suffix mRoPE ids, with an optional Qwen3-VL continuation delta."""
     if prefix_mask.ndim != 2 or suffix_mask.ndim != 2:
         raise ValueError("prefix_mask and suffix_mask must be rank-2 tensors")
     if prefix_mask.shape[0] != suffix_mask.shape[0]:
         raise ValueError("prefix_mask and suffix_mask batch sizes differ")
 
-    if prefix_rope_deltas.dtype != torch.long:
-        raise TypeError(
-            f"prefix_rope_deltas must have dtype torch.long, got {prefix_rope_deltas.dtype}"
-        )
-    if prefix_rope_deltas.ndim == 1:
-        prefix_rope_deltas = prefix_rope_deltas[:, None]
-    if tuple(prefix_rope_deltas.shape) != (prefix_mask.shape[0], 1):
-        raise ValueError(
-            "prefix_rope_deltas must have shape [batch, 1], got "
-            f"{tuple(prefix_rope_deltas.shape)}"
-        )
     prefix_offsets = prefix_mask.long().sum(dim=-1, keepdim=True)
-    prefix_offsets = prefix_offsets + prefix_rope_deltas.to(prefix_offsets.device)
+    if prefix_rope_deltas is not None:
+        if prefix_rope_deltas.dtype != torch.long:
+            raise TypeError(
+                f"prefix_rope_deltas must have dtype torch.long, got {prefix_rope_deltas.dtype}"
+            )
+        if prefix_rope_deltas.ndim == 1:
+            prefix_rope_deltas = prefix_rope_deltas[:, None]
+        if tuple(prefix_rope_deltas.shape) != (prefix_mask.shape[0], 1):
+            raise ValueError(
+                "prefix_rope_deltas must have shape [batch, 1], got "
+                f"{tuple(prefix_rope_deltas.shape)}"
+            )
+        prefix_offsets = prefix_offsets + prefix_rope_deltas.to(prefix_offsets.device)
 
     suffix_pos = prefix_offsets + torch.cumsum(suffix_mask.long(), dim=1) - 1
     return suffix_pos[None, ...].expand(3, -1, -1)
@@ -491,7 +501,7 @@ class RhinoActionExpert(nn.Module):
         x_t: Tensor,
         action_mask: Tensor | None,
         time: Tensor,
-        prefix_rope_deltas: Tensor,
+        prefix_rope_deltas: Tensor | None = None,
         prefix_layer_offset: int = 0,
     ) -> Tensor:
         suffix_embeds, suffix_mask, adarms_cond = self.io.embed_suffix(state, x_t, time)
@@ -521,16 +531,11 @@ def estimate_rhino_action_params(config: RhinoActionExpertConfig) -> dict[str, i
     qk_norm = config.head_dim * 2
     mlp = 3 * config.width * config.mlp_dim
     rms = 2 * config.width
-    adarms = 2 * (config.width * config.width * 3 + config.width * 3) if config.use_adarms else 0
+    adarms = 2 * (config.width * config.width * 3 + config.width * 3)
     layer = attn + qk_norm + mlp + rms + adarms
     stack = layer * config.depth
-    final_norm = config.width + (config.width * config.width * 3 + config.width * 3 if config.use_adarms else 0)
-    io = (
-        config.action_dim * config.width
-        + config.width * config.action_dim
-        + (config.width * 2) * config.width + config.width
-        + config.width * config.width + config.width
-    )
+    final_norm = config.width + config.width * config.width * 3 + config.width * 3
+    io = config.action_dim * config.width + config.width * config.action_dim
     if config.use_state_token and config.state_dim > 0:
         io += config.state_dim * config.width + config.width
     mask_condition = 0

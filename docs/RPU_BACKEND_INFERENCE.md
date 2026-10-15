@@ -1,6 +1,9 @@
 # RPU Backend Inference
 
-本文说明如何用即将开源的 `rpu_backend` 相关库，在 RPU/R1 侧运行本仓库训练出的 RhinoVLA checkpoint。
+本文说明本分支 RhinoVLA V3 与 `rpu_backend` 的接口约定，不代表 V3 已通过 RPU/R1 实机验证。
+V2 已冻结；本分支不兼容 V2 权重，也不能直接复用 V2 prepared artifact。
+部署需由匹配 V3 96D、AdaRMS 单路时间注入的 backend 和 artifact 支持。
+训练与权重入口见 [Finetuning Guide](FINETUNING_GUIDE.md)。
 
 ## 依赖边界
 
@@ -32,7 +35,7 @@ RhinoVLAPolicy.from_prepare_artifact(...).to("rpu")
 | RhinoVLA training `config.yaml` | 训练时使用的模型和数据配置，用于让 runtime 找到正确的 RhinoVLA 结构和预处理约定。 |
 | RhinoVLA `checkpoint` | 本仓库训练代码保存的 PyTorch 模型权重，例如 `steps_<n>_pytorch_model.pt`。 |
 | `norm.json` / norm sidecar | state/action 的归一化和反归一化统计。 |
-| native72 mapping YAML | 当 norm stats 仍是原始数据维度而不是 72D 时，用它展开到 RhinoVLA 72D slots。 |
+| native96 mapping YAML | 当 norm stats 仍是原始数据维度而不是 96D 时，用它展开到 RhinoVLA 96D slots。 |
 | 本仓库 `rhinovla` 包 | 提供 wrapper、norm/mapping 处理和本仓库模型代码路径。 |
 
 本 wrapper 不导入 `rpu_backend.adapters.*`、`rpu_backend.runtime.*`、`rpu_backend.tests.*` 等 private module，也不包含旧 board-kit 代码。
@@ -68,7 +71,7 @@ executor = RhinoVLARPUBackendExecutor(
     train_config="/path/to/config.yaml",
     checkpoint="/path/to/steps_1000_pytorch_model.pt",
     norm_stats_path="/path/to/norm.json",
-    mapping_path="/path/to/configs/data_mappings/robot_native72.yaml",
+    mapping_path="/path/to/configs/data_mappings/robot_native96.yaml",
     mapping_dataset_id="robot_dataset",
     instruction="pick up the object",
     num_steps=5,
@@ -105,8 +108,8 @@ executor.close()
 | `checkpoint` | 否 | 训练 checkpoint 路径。若提供，会作为 `RHINOVLA_CKPT` 写入 `runtime_env`，除非用户已显式覆盖同名 key。 |
 | `num_steps` | 否 | flow-matching denoise/inference steps，默认 `5`。应和 artifact、评测或部署 profile 对齐。 |
 | `action_hz` | 否 | 输出 action chunk 的动作频率 metadata，默认 `30.0`。 |
-| `active_slots` | 否 | 需要输出/执行的 72D action slots。未提供时优先使用 norm/mapping 里的 active action slots；72D stats 默认回退到 `0-15`。 |
-| `mapping_path` | 否 | native72 mapping YAML。native-dim norm stats 必须提供；72D stats 可不提供。 |
+| `active_slots` | 否 | 需要输出/执行的 96D action slots。未提供时优先使用 norm/mapping 里的 active action slots；96D stats 无此信息时回退到 `0-95`，部署时应显式核对。 |
+| `mapping_path` | 否 | native96 mapping YAML。native-dim norm stats 必须提供；96D stats 可不提供。 |
 | `mapping_dataset_id` | 否 | mapping YAML 中 `datasets` 列表的选择项。mapping 只有一个 dataset 时可省略。 |
 | `view_roles` | 否 | 图像视角角色，顺序必须和输入图片一致，默认 `["top_head", "hand_left", "hand_right"]`。 |
 | `view_modalities` | 否 | 图像模态，顺序必须和输入图片一致，默认 `["rgb", "rgb", "rgb"]`。 |
@@ -120,7 +123,7 @@ executor.close()
 | 参数 | 含义 |
 |---|---|
 | `images` | 图像序列，顺序必须和 `view_roles` / `view_modalities` 一致。元素可以是 PIL Image，也可以是可转为 uint8 image array 的对象。 |
-| `raw_state` | 未归一化的机器人 state。可以是完整 72D，也可以是长度等于 active state slots 的压缩 state。压缩 state 会先写入 72D active state slots，再做归一化。 |
+| `raw_state` | 未归一化的机器人 state。可以是完整 96D，也可以是长度等于 active state slots 的压缩 state。压缩 state 会先写入 96D active state slots，再做归一化。 |
 | `instruction` | 可选校验参数。若传入值和构造 executor 时的 `instruction` 不一致，会报错，因为当前 RPU prompt 是 locked 的。 |
 
 ### 输出字段
@@ -140,7 +143,7 @@ PREPARE_ARTIFACT=/path/to/rhinovla_prepare_artifact.pt \
 CONFIG=/path/to/config.yaml \
 CHECKPOINT=/path/to/steps_1000_pytorch_model.pt \
 NORM_STATS=/path/to/norm.json \
-MAPPING=/path/to/configs/data_mappings/robot_native72.yaml \
+MAPPING=/path/to/configs/data_mappings/robot_native96.yaml \
 MAPPING_DATASET_ID=robot_dataset \
 INSTRUCTION='pick up the object' \
 STATE='[0.0, 0.1, 0.2]' \
@@ -169,7 +172,7 @@ OUT=./rpu_backend_infer_output.json \
 | `ACTIVE_SLOTS` | `--active-slots` | 否 | action active slots，如 `0-15` 或 `0-6,14,15`。 |
 | `VIEW_ROLES` | `--view-roles` | 否 | 逗号分隔 view roles，默认 `top_head,hand_left,hand_right`。 |
 | `VIEW_MODALITIES` | `--view-modalities` | 否 | 逗号分隔 view modalities，默认 `rgb,rgb,rgb`。 |
-| `MAPPING` | `--mapping` | 否 | native72 mapping YAML。native-dim norm stats 必填。 |
+| `MAPPING` | `--mapping` | 否 | native96 mapping YAML。native-dim norm stats 必填。 |
 | `MAPPING_DATASET_ID` | `--mapping-dataset-id` | 否 | 选择 mapping YAML 中的 dataset entry。 |
 | `RPU_RHINO_REPO` | `--rpu-rhino-repo` | 否 | 传给 `rpu_backend` 的 RhinoVLA repo path override。 |
 | `RPU_ENV_FILE` | `--rpu-env-file` | 否 | TOML 文件，读取其中 `[env]` table 作为 runtime env。 |
@@ -190,6 +193,10 @@ OUT=./rpu_backend_infer_output.json \
 - checkpoint sidecar，例如 `steps_<n>_norm_stats.json`；
 - 扁平 JSON，包含 `state_mean`、`state_std`、`action_mean` 和 `action_std`。
 
-如果 stats 是 native source dimensions，需要同时传 matching native72 mapping 和 dataset id。wrapper 会把 source stats 展开到 RhinoVLA 72D slots，inactive mean 填 `0.0`，inactive std 填 `1.0`，并使用 mapping 中的 `active_state_slots` / `active_action_slots` 处理短 state 输入和 action metadata。
+如果 stats 是 native source dimensions，需要同时传 matching native96 mapping 和 dataset id。wrapper 会把 source stats 展开到 RhinoVLA 96D slots，inactive mean 填 `0.0`，inactive std 填 `1.0`，并使用 mapping 中的 `active_state_slots` / `active_action_slots` 处理短 state 输入和 action metadata。
 
-如果 stats 已经是 72D，mapping 可以不传。
+如果 stats 已经是 96D，mapping 可以不传。
+
+当前 wrapper 读取 `action_mean/std`，仅做反归一化，不自动选择 `action_delta_mean/std`，也不把
+delta 动作加回 current state。当前入口会拒绝声明为 delta 的训练配置或 norm 文件；本文示例仅适用于绝对动作模型。delta 模型需先核对并实现
+部署侧动作还原。训练侧 RTC 适配也不表示此 wrapper 已提供 RTC 调用接口。
