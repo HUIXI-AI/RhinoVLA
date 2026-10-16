@@ -906,7 +906,7 @@ def _expand_terminal_display_indices(
     chunk_len: int,
     max_frames: int,
 ) -> list[int]:
-    """Expand legal chunk starts into contiguous episode frames for TF plots."""
+    """Expand legal starts, repeating the terminal row when training pads it."""
 
     if not valid_start_indices:
         return []
@@ -914,11 +914,16 @@ def _expand_terminal_display_indices(
     last_exclusive = int(valid_start_indices[-1]) + int(chunk_len)
     if max_frames > 0:
         last_exclusive = min(last_exclusive, first + int(max_frames))
+    real_end = min(last_exclusive, len(dataset.lerobot.hf_dataset))
+    remaining = getattr(dataset, "_valid_frames_remaining", None)
+    if remaining is not None:
+        last_start = int(valid_start_indices[-1])
+        real_end = min(real_end, last_start + int(remaining[last_start]))
     first_payload = dataset.get_row_payload(first)
     episode_index = int(first_payload.get("episode_index", -1))
     expected_frame = int(first_payload.get("frame_index", first))
     out: list[int] = []
-    for global_i in range(first, last_exclusive):
+    for global_i in range(first, real_end):
         payload = dataset.get_row_payload(int(global_i))
         frame = int(payload.get("frame_index", global_i))
         if int(payload.get("episode_index", -999999)) != episode_index:
@@ -927,6 +932,8 @@ def _expand_terminal_display_indices(
             break
         out.append(int(global_i))
         expected_frame = frame + 1
+    if out and getattr(dataset, "pad_episode_end", False):
+        out.extend([out[-1]] * (last_exclusive - first - len(out)))
     return out
 
 
@@ -1255,7 +1262,8 @@ class _VizMixin:
             return None
 
         payloads = [dataset.get_row_payload(row) for row in row_indices]
-        frame_ids = np.asarray([int(p.get("frame_index", i)) for i, p in enumerate(payloads)], dtype=np.int64)
+        first_frame = int(payloads[0].get("frame_index", row_indices[0]))
+        frame_ids = np.arange(first_frame, first_frame + len(payloads), dtype=np.int64)
         action_raw = np.stack([np.asarray(p["action_raw"], dtype=np.float32) for p in payloads], axis=0)
         state_raw_rows = np.stack([np.asarray(p["state_raw"], dtype=np.float32) for p in payloads], axis=0)
         first_mask = np.asarray(sample.get("action_mask", np.ones((1, action_raw.shape[-1]))), dtype=np.float32)
@@ -1276,7 +1284,10 @@ class _VizMixin:
         fallback_prompt = str(sample.get("lang") or payload0.get("subtask_prompt") or "")
         fixed_instruction = getattr(dataset, "fixed_instruction", None)
         camera_keys = list(getattr(dataset, "camera_source_keys", []))
-        row_positions = {int(row): pos for pos, row in enumerate(row_indices)}
+        row_positions: dict[int, int] = {}
+        for pos, row in enumerate(row_indices):
+            # Repeated padding rows are not additional model input frames.
+            row_positions.setdefault(int(row), pos)
         valid_chunk_positions = {
             row_positions[int(row)]
             for row in valid_start_indices
