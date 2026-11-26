@@ -130,11 +130,12 @@ RhinoVLA 运行在智元 G1 与辉羲 R1 芯片上，完成双臂柔性物体操
 
 ## 💬 Contact
 
-微信公众号：
-
-<p align="left">
-  <img src="assets/huixi_wechat_qrcode.png" alt="辉羲智能微信公众号二维码" width="360" />
-</p>
+- **生态合作** · **[ecosystem@rhino.auto](mailto:ecosystem@rhino.auto)**
+- **商务合作** · **[business@rhino.auto](mailto:business@rhino.auto)**
+- **微信公众号**
+  <p align="left">
+    <img src="assets/huixi_wechat_qrcode.png" alt="辉羲智能微信公众号二维码" width="360" />
+  </p>
 
 ## Acknowledgments
 

@@ -131,11 +131,12 @@ and bundled third-party resource files are listed in
 
 ## 💬 Contact
 
-WeChat Official Account:
-
-<p align="left">
-  <img src="assets/huixi_wechat_qrcode.png" alt="Huixi AI WeChat official account QR code" width="360" />
-</p>
+- **Ecosystem Partnerships** · **[ecosystem@rhino.auto](mailto:ecosystem@rhino.auto)**
+- **Business Partnerships** · **[business@rhino.auto](mailto:business@rhino.auto)**
+- **WeChat Official Account**
+  <p align="left">
+    <img src="assets/huixi_wechat_qrcode.png" alt="Huixi AI WeChat official account QR code" width="360" />
+  </p>
 
 ## Acknowledgments
 
